@@ -48,7 +48,8 @@ make sure a maintainer gets a `.changeset/*.md` file onto `main`.
    - run tests
    - publish to npm
    - create tag `vX.Y.Z`
-   - create the GitHub release
+   - create the GitHub release using the matching `CHANGELOG.md` section as the primary notes
+   - prepend those notes ahead of GitHub's generated contributor and compare summary
 
 ## External setup required
 
