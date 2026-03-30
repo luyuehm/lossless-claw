@@ -50,9 +50,11 @@ export interface CompactionConfig {
   maxRounds: number;
   /** IANA timezone for timestamps in summaries (default: UTC) */
   timezone?: string;
+  /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
+  summaryMaxOverageFactor: number;
 }
 
-type CompactionLevel = "normal" | "aggressive" | "fallback";
+type CompactionLevel = "normal" | "aggressive" | "fallback" | "capped";
 type CompactionPass = "leaf" | "condensed";
 type CompactionSummarizeOptions = {
   previousSummary?: string;
@@ -84,6 +86,30 @@ type CondensedPhaseCandidate = {
 /** Estimate token count from character length (~4 chars per token). */
 function estimateTokens(content: string): number {
   return Math.ceil(content.length / 4);
+}
+
+/** Deterministically cap summary text so the persisted output stays within maxTokens. */
+function capSummaryText(
+  content: string,
+  originalTokens: number,
+  maxTokens: number,
+): string {
+  const suffixes = [
+    `\n[Capped from ${originalTokens} tokens to ~${maxTokens}]`,
+    `\n[Capped to ~${maxTokens}]`,
+    "\n[Capped]",
+    "",
+  ];
+
+  for (const suffix of suffixes) {
+    const maxChars = Math.max(0, maxTokens * 4 - suffix.length);
+    const capped = `${content.slice(0, maxChars)}${suffix}`;
+    if (estimateTokens(capped) <= maxTokens) {
+      return capped;
+    }
+  }
+
+  return content.slice(0, Math.max(0, maxTokens * 4));
 }
 
 /** Format a timestamp as `YYYY-MM-DD HH:mm TZ` for prompt source text. */
@@ -1149,6 +1175,8 @@ export class CompactionEngine {
     sourceText: string;
     summarize: CompactionSummarizeFn;
     options?: CompactionSummarizeOptions;
+    /** Target token count for this summary kind (leaf or condensed). Used for hard-cap enforcement. */
+    targetTokens: number;
   }): Promise<{ content: string; level: CompactionLevel } | null> {
     const sourceText = params.sourceText.trim();
     if (!sourceText) {
@@ -1213,6 +1241,21 @@ export class CompactionEngine {
       if (estimateTokens(summaryText) >= inputTokens) {
         return buildDeterministicFallback();
       }
+    }
+
+    // Hard cap: enforce maximum summary size relative to the kind-appropriate target.
+    const summaryTokens = estimateTokens(summaryText);
+    const maxTokens = Math.ceil(params.targetTokens * this.config.summaryMaxOverageFactor);
+
+    if (summaryTokens > Math.ceil(params.targetTokens * 1.5)) {
+      console.warn(
+        `[lcm] summary exceeds target by ${Math.round((summaryTokens / params.targetTokens - 1) * 100)}%: ${summaryTokens} tokens vs target ${params.targetTokens}`,
+      );
+    }
+
+    if (summaryTokens > maxTokens) {
+      summaryText = capSummaryText(summaryText, summaryTokens, maxTokens);
+      level = "capped";
     }
 
     return { content: summaryText, level };
@@ -1307,6 +1350,7 @@ export class CompactionEngine {
         previousSummary: previousSummaryContent,
         isCondensed: false,
       },
+      targetTokens: this.config.leafTargetTokens,
     });
     if (!summary) {
       console.warn(
@@ -1414,6 +1458,7 @@ export class CompactionEngine {
         isCondensed: true,
         depth: targetDepth + 1,
       },
+      targetTokens: this.config.condensedTargetTokens,
     });
     if (!condensed) {
       console.warn(
