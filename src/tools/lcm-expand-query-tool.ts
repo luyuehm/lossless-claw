@@ -75,9 +75,20 @@ type ExpandQueryReply = {
   truncated: boolean;
 };
 
+type ParsedExpandQueryReply =
+  | {
+      ok: true;
+      value: ExpandQueryReply;
+    }
+  | {
+      ok: false;
+      error: string;
+    };
+
 type SummaryCandidate = {
   summaryId: string;
   conversationId: number;
+  requiresMessageExpansion: boolean;
 };
 
 function collectExpansionFailureText(value: unknown, parts: string[], depth = 0): void {
@@ -155,6 +166,7 @@ function shouldRetryWithoutOverride(message: string): boolean {
  */
 function buildDelegatedExpandQueryTask(params: {
   summaryIds: string[];
+  messageBackedSummaryIds: string[];
   conversationId: number;
   query?: string;
   prompt: string;
@@ -165,6 +177,10 @@ function buildDelegatedExpandQueryTask(params: {
   originSessionKey: string;
 }) {
   const seedSummaryIds = params.summaryIds.length > 0 ? params.summaryIds.join(", ") : "(none)";
+  const messageBackedSummaryIds =
+    params.messageBackedSummaryIds.length > 0
+      ? params.messageBackedSummaryIds.join(", ")
+      : "(none)";
   return [
     "You are an autonomous LCM retrieval navigator. Plan and execute retrieval before answering.",
     "",
@@ -172,6 +188,7 @@ function buildDelegatedExpandQueryTask(params: {
     `Conversation scope: ${params.conversationId}`,
     `Expansion token budget (total across this run): ${params.tokenCap}`,
     `Seed summary IDs: ${seedSummaryIds}`,
+    `Seed summaries requiring raw message expansion: ${messageBackedSummaryIds}`,
     params.query ? `Routing query: ${params.query}` : undefined,
     "",
     "Strategy:",
@@ -179,7 +196,7 @@ function buildDelegatedExpandQueryTask(params: {
     "2. If additional candidates are needed, use `lcm_grep` scoped to summaries.",
     "3. Select branches that fit remaining budget; prefer high-signal paths first.",
     "4. Call `lcm_expand` selectively (do not expand everything blindly).",
-    "5. Keep includeMessages=false by default; use includeMessages=true only for specific leaf evidence.",
+    "5. Keep includeMessages=false by default; use includeMessages=true for the message-backed seed summaries above and any other specific leaf evidence.",
     `6. Stay within ${params.tokenCap} total expansion tokens across all lcm_expand calls.`,
     "",
     "User prompt to answer:",
@@ -211,24 +228,25 @@ function buildDelegatedExpandQueryTask(params: {
   ].join("\n");
 }
 
+function formatInvalidDelegatedReply(reply: string, reason: string): string {
+  const compact = reply.replace(/\s+/g, " ").trim();
+  const snippet = compact.length <= 240 ? compact : `${compact.slice(0, 240)}...`;
+  return `Delegated expansion query returned ${reason}: ${snippet}`;
+}
+
 /**
- * Parse the child reply; accepts plain JSON or fenced JSON.
+ * Parse the child reply; accepts plain JSON or fenced JSON and rejects malformed fallbacks.
  */
 function parseDelegatedExpandQueryReply(
   rawReply: string | undefined,
   fallbackExpandedSummaryCount: number,
-): ExpandQueryReply {
-  const fallback: ExpandQueryReply = {
-    answer: (rawReply ?? "").trim(),
-    citedIds: [],
-    expandedSummaryCount: fallbackExpandedSummaryCount,
-    totalSourceTokens: 0,
-    truncated: false,
-  };
-
+): ParsedExpandQueryReply {
   const reply = rawReply?.trim();
   if (!reply) {
-    return fallback;
+    return {
+      ok: false,
+      error: "Delegated expansion query returned an empty reply.",
+    };
   }
 
   const candidates: string[] = [reply];
@@ -247,6 +265,12 @@ function parseDelegatedExpandQueryReply(
         truncated?: unknown;
       };
       const answer = typeof parsed.answer === "string" ? parsed.answer.trim() : "";
+      if (!answer) {
+        return {
+          ok: false,
+          error: formatInvalidDelegatedReply(reply, 'JSON without a non-empty "answer"'),
+        };
+      }
       const citedIds = normalizeSummaryIds(
         Array.isArray(parsed.citedIds)
           ? parsed.citedIds.filter((value): value is string => typeof value === "string")
@@ -264,18 +288,24 @@ function parseDelegatedExpandQueryReply(
       const truncated = parsed.truncated === true;
 
       return {
-        answer: answer || fallback.answer,
-        citedIds,
-        expandedSummaryCount,
-        totalSourceTokens,
-        truncated,
+        ok: true,
+        value: {
+          answer,
+          citedIds,
+          expandedSummaryCount,
+          totalSourceTokens,
+          truncated,
+        },
       };
     } catch {
       // Try next candidate.
     }
   }
 
-  return fallback;
+  return {
+    ok: false,
+    error: formatInvalidDelegatedReply(reply, "non-JSON output"),
+  };
 }
 
 /**
@@ -316,6 +346,22 @@ function resolveSourceConversationId(params: {
   );
 }
 
+function upsertSummaryCandidate(
+  candidates: Map<string, SummaryCandidate>,
+  candidate: SummaryCandidate,
+): void {
+  const existing = candidates.get(candidate.summaryId);
+  if (!existing) {
+    candidates.set(candidate.summaryId, candidate);
+    return;
+  }
+  candidates.set(candidate.summaryId, {
+    ...existing,
+    requiresMessageExpansion:
+      existing.requiresMessageExpansion || candidate.requiresMessageExpansion,
+  });
+}
+
 /**
  * Resolve summary candidates from explicit IDs and/or query matches.
  */
@@ -333,13 +379,15 @@ async function resolveSummaryCandidates(params: {
     if (!described || described.type !== "summary" || !described.summary) {
       throw new Error(`Summary not found: ${summaryId}`);
     }
-    candidates.set(summaryId, {
+    upsertSummaryCandidate(candidates, {
       summaryId,
       conversationId: described.summary.conversationId,
+      requiresMessageExpansion: false,
     });
   }
 
   if (params.query) {
+    const summaryStore = params.lcm.getSummaryStore();
     const grepResult = await retrieval.grep({
       query: params.query,
       mode: "full_text",
@@ -347,10 +395,45 @@ async function resolveSummaryCandidates(params: {
       conversationId: params.conversationId,
     });
     for (const summary of grepResult.summaries) {
-      candidates.set(summary.summaryId, {
+      upsertSummaryCandidate(candidates, {
         summaryId: summary.summaryId,
         conversationId: summary.conversationId,
+        requiresMessageExpansion: false,
       });
+    }
+
+    if (grepResult.summaries.length === 0 && typeof params.conversationId === "number") {
+      const maxDepth = await summaryStore.getConversationMaxSummaryDepth(params.conversationId);
+      if (typeof maxDepth === "number" && maxDepth <= 1) {
+        const messageResult = await retrieval.grep({
+          query: params.query,
+          mode: "full_text",
+          scope: "messages",
+          conversationId: params.conversationId,
+        });
+        const messageIds = messageResult.messages.map((message) => message.messageId);
+        const leafLinks = await summaryStore.getLeafSummaryLinksForMessageIds(
+          params.conversationId,
+          messageIds,
+        );
+        const summaryIdsByMessageId = new Map<number, string[]>();
+        for (const link of leafLinks) {
+          const linkedSummaryIds = summaryIdsByMessageId.get(link.messageId) ?? [];
+          if (!linkedSummaryIds.includes(link.summaryId)) {
+            linkedSummaryIds.push(link.summaryId);
+            summaryIdsByMessageId.set(link.messageId, linkedSummaryIds);
+          }
+        }
+        for (const message of messageResult.messages) {
+          for (const summaryId of summaryIdsByMessageId.get(message.messageId) ?? []) {
+            upsertSummaryCandidate(candidates, {
+              summaryId,
+              conversationId: params.conversationId,
+              requiresMessageExpansion: true,
+            });
+          }
+        }
+      }
     }
   }
 
@@ -505,6 +588,15 @@ export function createLcmExpandQueryTool(input: {
             .filter((candidate) => candidate.conversationId === sourceConversationId)
             .map((candidate) => candidate.summaryId),
         );
+        const messageBackedSummaryIds = normalizeSummaryIds(
+          candidates
+            .filter(
+              (candidate) =>
+                candidate.conversationId === sourceConversationId &&
+                candidate.requiresMessageExpansion,
+            )
+            .map((candidate) => candidate.summaryId),
+        );
 
         if (summaryIds.length === 0) {
           return jsonResult({
@@ -520,6 +612,7 @@ export function createLcmExpandQueryTool(input: {
 
         const task = buildDelegatedExpandQueryTask({
           summaryIds,
+          messageBackedSummaryIds,
           conversationId: sourceConversationId,
           query: query || undefined,
           prompt,
@@ -532,10 +625,13 @@ export function createLcmExpandQueryTool(input: {
 
         const expansionProvider = input.deps.config.expansionProvider || undefined;
         const expansionModel = input.deps.config.expansionModel || undefined;
+        const canonicalExpansionModel = expansionModel?.includes("/") ? expansionModel : undefined;
+        const delegatedOverrideProvider = canonicalExpansionModel ? undefined : expansionProvider;
+        const delegatedOverrideModel = canonicalExpansionModel || expansionModel;
         const configuredOverrideLabel =
-          expansionProvider && expansionModel
-            ? `${expansionProvider}/${expansionModel}`
-            : expansionModel || expansionProvider || "configured override";
+          delegatedOverrideProvider && delegatedOverrideModel
+            ? `${delegatedOverrideProvider}/${delegatedOverrideModel}`
+            : delegatedOverrideModel || delegatedOverrideProvider || "configured override";
 
         const runDelegatedQuery = async (provider?: string, model?: string) => {
           const childSessionKey = `agent:${requesterAgentId}:subagent:${crypto.randomUUID()}`;
@@ -623,6 +719,9 @@ export function createLcmExpandQueryTool(input: {
               Array.isArray(replyPayload.messages) ? replyPayload.messages : [],
             );
             const parsed = parseDelegatedExpandQueryReply(reply, summaryIds.length);
+            if (!parsed.ok) {
+              throw new Error(parsed.error);
+            }
             recordExpansionDelegationTelemetry({
               deps: input.deps,
               component: "lcm_expand_query",
@@ -635,12 +734,12 @@ export function createLcmExpandQueryTool(input: {
             });
 
             return jsonResult({
-              answer: parsed.answer,
-              citedIds: parsed.citedIds,
+              answer: parsed.value.answer,
+              citedIds: parsed.value.citedIds,
               sourceConversationId,
-              expandedSummaryCount: parsed.expandedSummaryCount,
-              totalSourceTokens: parsed.totalSourceTokens,
-              truncated: parsed.truncated,
+              expandedSummaryCount: parsed.value.expandedSummaryCount,
+              totalSourceTokens: parsed.value.totalSourceTokens,
+              truncated: parsed.value.truncated,
             });
           } finally {
             try {
@@ -664,7 +763,7 @@ export function createLcmExpandQueryTool(input: {
         }
 
         try {
-          return await runDelegatedQuery(expansionProvider, expansionModel);
+          return await runDelegatedQuery(delegatedOverrideProvider, delegatedOverrideModel);
         } catch (error) {
           const failure = formatExpansionFailure(error);
           input.deps.log.warn(
