@@ -2116,6 +2116,13 @@ export class LcmContextEngine implements ContextEngine {
    * Remove messages from the batch that already exist in the DB for this session.
    * Conservative replay detection: only strip a prefix when the incoming
    * batch begins with the entire stored transcript for the session.
+   *
+   * Fixes two issues from #246:
+   * 1. Replaced hasMessage() fast-path with aligned-tail check — the old
+   *    approach false-positives on legitimate repeated first messages
+   * 2. Dedup now runs on newMessages only, before autoCompactionSummary
+   *    is prepended — synthetic summaries can no longer interfere with
+   *    replay detection
    */
   private async deduplicateAfterTurnBatch(
     sessionId: string,
@@ -2127,31 +2134,34 @@ export class LcmContextEngine implements ContextEngine {
     if (!conversation) return batch;
 
     const conversationId = conversation.conversationId;
-    const lastDbMessage = await this.conversationStore.getLastMessage(conversationId);
-    if (!lastDbMessage) return batch;
-
-    // Fast path: if the first incoming message doesn't exist in the DB at all,
-    // the entire batch is genuinely new (the common, no-restart case).
-    const firstStored = toStoredMessage(batch[0]!);
-    const firstExists = await this.conversationStore.hasMessage(
-      conversationId,
-      firstStored.role,
-      firstStored.content,
-    );
-    if (!firstExists) return batch;
-
     const storedMessageCount = await this.conversationStore.getMessageCount(conversationId);
-    if (storedMessageCount > batch.length) {
+    if (storedMessageCount === 0 || storedMessageCount > batch.length) {
       return batch;
     }
 
-    // Replay path: after a gateway restart, afterTurn receives the full
-    // session history rebuilt from JSONL. Only trim when the incoming batch
-    // starts with the exact stored transcript in order.
+    // Aligned-tail check: DB's last message must match the message at the
+    // exact replay boundary in the incoming batch. This replaces the
+    // hasMessage() check which could false-positive on any repeated content.
+    const lastDbMessage = await this.conversationStore.getLastMessage(conversationId);
+    if (!lastDbMessage) return batch;
+
     const storedBatch = batch.map((m) => toStoredMessage(m));
+    const batchAtBoundary = storedBatch[storedMessageCount - 1]!;
+    if (
+      messageIdentity(lastDbMessage.role, lastDbMessage.content) !==
+      messageIdentity(batchAtBoundary.role, batchAtBoundary.content)
+    ) {
+      return batch;
+    }
+
+    // Full proof: incoming batch must start with the entire stored transcript
+    // in exact order before we trim anything.
     const storedMessages = await this.conversationStore.getMessages(conversationId, {
       limit: storedMessageCount,
     });
+    if (storedMessages.length !== storedMessageCount) {
+      return batch;
+    }
     for (let i = 0; i < storedMessageCount; i += 1) {
       const storedConversationMessage = storedMessages[i]!;
       const incomingMessage = storedBatch[i]!;
@@ -2317,6 +2327,12 @@ export class LcmContextEngine implements ContextEngine {
     }
     this.ensureMigrated();
 
+    // Dedup guard: prevent duplicate ingestion when gateway restart replays
+    // full history. Run on newMessages BEFORE prepending autoCompactionSummary
+    // so synthetic summaries cannot interfere with replay detection.
+    const newMessages = params.messages.slice(params.prePromptMessageCount);
+    const dedupedNewMessages = await this.deduplicateAfterTurnBatch(params.sessionId, newMessages);
+
     const ingestBatch: AgentMessage[] = [];
     if (params.autoCompactionSummary) {
       ingestBatch.push({
@@ -2325,15 +2341,8 @@ export class LcmContextEngine implements ContextEngine {
       } as AgentMessage);
     }
 
-    const newMessages = params.messages.slice(params.prePromptMessageCount);
-    ingestBatch.push(...newMessages);
+    ingestBatch.push(...dedupedNewMessages);
     if (ingestBatch.length === 0) {
-      return;
-    }
-
-    // Dedup guard: prevent duplicate ingestion when gateway restart replays full history.
-    const dedupedBatch = await this.deduplicateAfterTurnBatch(params.sessionId, ingestBatch);
-    if (dedupedBatch.length === 0) {
       return;
     }
 
@@ -2341,7 +2350,7 @@ export class LcmContextEngine implements ContextEngine {
       await this.ingestBatch({
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
-        messages: dedupedBatch,
+        messages: ingestBatch,
         isHeartbeat: params.isHeartbeat === true,
       });
     } catch (err) {
