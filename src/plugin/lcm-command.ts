@@ -710,11 +710,14 @@ async function buildDoctorApplyText(params: {
 }
 
 export function createLcmCommand(params: {
-  db: DatabaseSync;
+  db: DatabaseSync | (() => DatabaseSync | Promise<DatabaseSync>);
   config: LcmConfig;
   deps?: LcmDependencies;
   summarize?: LcmSummarizeFn;
 }): OpenClawPluginCommandDefinition {
+  const getDb = async (): Promise<DatabaseSync> =>
+    typeof params.db === "function" ? await params.db() : params.db;
+
   return {
     name: "lcm",
     nativeNames: {
@@ -726,19 +729,19 @@ export function createLcmCommand(params: {
       const parsed = parseLcmCommand(ctx.args);
       switch (parsed.kind) {
         case "status":
-          return { text: await buildStatusText({ ctx, db: params.db, config: params.config }) };
+          return { text: await buildStatusText({ ctx, db: await getDb(), config: params.config }) };
         case "doctor":
           return parsed.apply
             ? {
                 text: await buildDoctorApplyText({
                   ctx,
-                  db: params.db,
+                  db: await getDb(),
                   config: params.config,
                   deps: params.deps,
                   summarize: params.summarize,
                 }),
               }
-            : { text: await buildDoctorText({ ctx, db: params.db }) };
+            : { text: await buildDoctorText({ ctx, db: await getDb() }) };
         case "help":
           return { text: buildHelpText(parsed.error) };
       }

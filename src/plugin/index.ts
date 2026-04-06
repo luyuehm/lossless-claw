@@ -6,9 +6,10 @@
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { resolveLcmConfig } from "../db/config.js";
-import { createLcmDatabaseConnection } from "../db/connection.js";
+import { closeLcmConnection, createLcmDatabaseConnection } from "../db/connection.js";
 import { LcmContextEngine } from "../engine.js";
 import { logStartupBannerOnce } from "../startup-banner-log.js";
 import { createLcmDescribeTool } from "../tools/lcm-describe-tool.js";
@@ -1563,11 +1564,151 @@ const lcmPlugin = {
 
   register(api: OpenClawPluginApi) {
     const deps = createLcmDependencies(api);
-    const database = createLcmDatabaseConnection(deps.config.databasePath);
-    const lcm = new LcmContextEngine(deps, database);
+    const dbPath = deps.config.databasePath;
 
+    // ── Eager-first DB init with deferred fallback on lock ──────────
+    let database: DatabaseSync | null = null;
+    let lcm: LcmContextEngine | null = null;
+    let initPromise: Promise<LcmContextEngine> | null = null;
+    let initError: Error | null = null;
+    let resolveDeferredInit: ((engine: LcmContextEngine) => void) | null = null;
+    let rejectDeferredInit: ((error: Error) => void) | null = null;
+    let stopped = false;
+
+    /** Normalize unknown failures into stable Error instances. */
+    function toInitError(error: unknown): Error {
+      return error instanceof Error ? error : new Error(String(error));
+    }
+
+    /** Build a live DB+engine pair and roll back the DB handle if engine init fails. */
+    function initializeEngine(): LcmContextEngine {
+      const nextDatabase = createLcmDatabaseConnection(dbPath);
+      try {
+        const nextEngine = new LcmContextEngine(deps, nextDatabase);
+        database = nextDatabase;
+        lcm = nextEngine;
+        initError = null;
+        return nextEngine;
+      } catch (error) {
+        closeLcmConnection(nextDatabase);
+        throw error;
+      }
+    }
+
+    /** Keep one shared deferred init promise so early callers all await the same retry. */
+    function ensureDeferredInitPromise(): Promise<LcmContextEngine> {
+      if (initPromise) {
+        return initPromise;
+      }
+
+      initPromise = new Promise<LcmContextEngine>((resolve, reject) => {
+        resolveDeferredInit = resolve;
+        rejectDeferredInit = reject;
+      });
+      initPromise.catch(() => {});
+      return initPromise;
+    }
+
+    /** Resolve the shared deferred init promise exactly once. */
+    function resolveDeferredEngine(nextEngine: LcmContextEngine): void {
+      const resolve = resolveDeferredInit;
+      resolveDeferredInit = null;
+      rejectDeferredInit = null;
+      resolve?.(nextEngine);
+    }
+
+    /** Reject the shared deferred init promise exactly once and retain the root cause. */
+    function rejectDeferredEngine(error: Error): void {
+      initError = error;
+      const reject = rejectDeferredInit;
+      resolveDeferredInit = null;
+      rejectDeferredInit = null;
+      reject?.(error);
+    }
+
+    /** Return the initialized engine, waiting for deferred startup when the DB is lock-contended. */
+    async function waitForEngine(): Promise<LcmContextEngine> {
+      if (stopped) {
+        throw new Error("[lcm] Database connection closed after gateway_stop");
+      }
+      if (initError) {
+        throw initError;
+      }
+      if (lcm) {
+        return lcm;
+      }
+      if (initPromise) {
+        return initPromise;
+      }
+
+      try {
+        const nextEngine = initializeEngine();
+        initPromise = Promise.resolve(nextEngine);
+        return nextEngine;
+      } catch (error) {
+        const normalized = toInitError(error);
+        if (!/database is locked/i.test(normalized.message)) {
+          initError = normalized;
+          throw normalized;
+        }
+
+        console.error("[lcm] DB locked during eager init, deferring to gateway_start");
+        return ensureDeferredInitPromise();
+      }
+    }
+
+    /** Return the initialized DB handle, sharing the same wait/error semantics as the engine. */
+    async function waitForDatabase(): Promise<DatabaseSync> {
+      await waitForEngine();
+      if (!database) {
+        throw initError ?? new Error("[lcm] Database initialization finished without a handle");
+      }
+      return database;
+    }
+
+    try {
+      const nextEngine = initializeEngine();
+      initPromise = Promise.resolve(nextEngine);
+    } catch (error) {
+      const normalized = toInitError(error);
+      if (!/database is locked/i.test(normalized.message)) {
+        initError = normalized;
+        throw normalized;
+      }
+
+      console.error("[lcm] DB locked during eager init, deferring to gateway_start");
+      ensureDeferredInitPromise();
+      api.on("gateway_start", async () => {
+        if (stopped || lcm || initError) {
+          return;
+        }
+        try {
+          const nextEngine = initializeEngine();
+          initPromise = Promise.resolve(nextEngine);
+          resolveDeferredEngine(nextEngine);
+        } catch (retryError) {
+          const normalizedRetryError = toInitError(retryError);
+          rejectDeferredEngine(normalizedRetryError);
+          console.error(`[lcm] Deferred DB init failed: ${normalizedRetryError.message}`);
+        }
+      });
+    }
+
+    api.on("gateway_stop", async () => {
+      stopped = true;
+      if (!lcm && !database) {
+        rejectDeferredEngine(new Error("[lcm] Database connection closed after gateway_stop"));
+      }
+      if (database) {
+        closeLcmConnection(database);
+        database = null;
+      }
+      lcm = null;
+    });
+
+    // ── Event handlers ──────────────────────────────────────────────
     api.on("before_reset", async (event, ctx) => {
-      await lcm.handleBeforeReset({
+      await (await waitForEngine()).handleBeforeReset({
         reason: event.reason,
         sessionId: ctx.sessionId,
         sessionKey: ctx.sessionKey,
@@ -1578,7 +1719,7 @@ const lcmPlugin = {
     }));
     api.on("session_end", async (event) => {
       const lifecycleEvent = event as SessionEndLifecycleEvent;
-      await lcm.handleSessionEnd({
+      await (await waitForEngine()).handleSessionEnd({
         reason: lifecycleEvent.reason,
         sessionId: lifecycleEvent.sessionId,
         sessionKey: lifecycleEvent.sessionKey,
@@ -1586,40 +1727,46 @@ const lcmPlugin = {
         nextSessionKey: lifecycleEvent.nextSessionKey,
       });
     });
-    api.registerContextEngine("lossless-claw", () => lcm);
-    api.registerContextEngine("default", () => lcm);
+
+    // ── Context engines ─────────────────────────────────────────────
+    api.registerContextEngine("lossless-claw", () => lcm ?? waitForEngine());
+    api.registerContextEngine("default", () => lcm ?? waitForEngine());
+
+    // ── Tools ───────────────────────────────────────────────────────
     api.registerTool((ctx) =>
       createLcmGrepTool({
         deps,
-        lcm,
+        getLcm: waitForEngine,
         sessionKey: ctx.sessionKey,
       }),
     );
     api.registerTool((ctx) =>
       createLcmDescribeTool({
         deps,
-        lcm,
+        getLcm: waitForEngine,
         sessionKey: ctx.sessionKey,
       }),
     );
     api.registerTool((ctx) =>
       createLcmExpandTool({
         deps,
-        lcm,
+        getLcm: waitForEngine,
         sessionKey: ctx.sessionKey,
       }),
     );
     api.registerTool((ctx) =>
       createLcmExpandQueryTool({
         deps,
-        lcm,
+        getLcm: waitForEngine,
         sessionKey: ctx.sessionKey,
         requesterSessionKey: ctx.sessionKey,
       }),
     );
+
+    // ── Command ─────────────────────────────────────────────────────
     api.registerCommand(
       createLcmCommand({
-        db: database,
+        db: waitForDatabase,
         config: deps.config,
         deps,
       }),
