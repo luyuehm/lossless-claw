@@ -25,6 +25,14 @@ describe("resolveLcmConfig", () => {
     expect(config.summaryProvider).toBe("");
     expect(config.summaryModel).toBe("");
     expect(config.pruneHeartbeatOk).toBe(false);
+    expect(config.cacheAwareCompaction).toEqual({
+      enabled: true,
+      maxColdCacheCatchupPasses: 2,
+    });
+    expect(config.dynamicLeafChunkTokens).toEqual({
+      enabled: false,
+      max: 40000,
+    });
   });
 
   it("reads values from plugin config", () => {
@@ -41,6 +49,14 @@ describe("resolveLcmConfig", () => {
       condensedMinFanout: 2,
       pruneHeartbeatOk: true,
       enabled: false,
+      cacheAwareCompaction: {
+        enabled: false,
+        maxColdCacheCatchupPasses: 3,
+      },
+      dynamicLeafChunkTokens: {
+        enabled: true,
+        max: 50000,
+      },
     });
     expect(config.enabled).toBe(false);
     expect(config.ignoreSessionPatterns).toEqual([
@@ -57,6 +73,14 @@ describe("resolveLcmConfig", () => {
     expect(config.leafMinFanout).toBe(4);
     expect(config.condensedMinFanout).toBe(2);
     expect(config.pruneHeartbeatOk).toBe(true);
+    expect(config.cacheAwareCompaction).toEqual({
+      enabled: false,
+      maxColdCacheCatchupPasses: 3,
+    });
+    expect(config.dynamicLeafChunkTokens).toEqual({
+      enabled: true,
+      max: 80000,
+    });
   });
 
   it("env vars override plugin config", () => {
@@ -69,6 +93,10 @@ describe("resolveLcmConfig", () => {
       LCM_IGNORE_SESSION_PATTERNS: "agent:*:cron:*, agent:main:subagent:**",
       LCM_STATELESS_SESSION_PATTERNS: "agent:*:ephemeral:**, agent:main:preview:*",
       LCM_SKIP_STATELESS_SESSIONS: "false",
+      LCM_CACHE_AWARE_COMPACTION_ENABLED: "false",
+      LCM_MAX_COLD_CACHE_CATCHUP_PASSES: "4",
+      LCM_DYNAMIC_LEAF_CHUNK_TOKENS_ENABLED: "true",
+      LCM_DYNAMIC_LEAF_CHUNK_TOKENS_MAX: "60000",
     } as NodeJS.ProcessEnv;
     const pluginConfig = {
       contextThreshold: 0.5,
@@ -78,6 +106,14 @@ describe("resolveLcmConfig", () => {
       statelessSessionPatterns: ["agent:*:preview:*"],
       skipStatelessSessions: true,
       enabled: true,
+      cacheAwareCompaction: {
+        enabled: true,
+        maxColdCacheCatchupPasses: 2,
+      },
+      dynamicLeafChunkTokens: {
+        enabled: false,
+        max: 50000,
+      },
     };
     const config = resolveLcmConfig(env, pluginConfig);
     expect(config.enabled).toBe(false); // env wins
@@ -94,6 +130,14 @@ describe("resolveLcmConfig", () => {
     expect(config.freshTailCount).toBe(64); // env wins
     expect(config.newSessionRetainDepth).toBe(5); // env wins
     expect(config.incrementalMaxDepth).toBe(3); // env wins
+    expect(config.cacheAwareCompaction).toEqual({
+      enabled: false,
+      maxColdCacheCatchupPasses: 4,
+    });
+    expect(config.dynamicLeafChunkTokens).toEqual({
+      enabled: true,
+      max: 60000,
+    });
   });
 
   it("plugin config fills gaps when env vars are absent", () => {
@@ -195,6 +239,61 @@ describe("resolveLcmConfig", () => {
       delegationTimeoutMs: 300000,
     });
     expect(config.delegationTimeoutMs).toBe(300000);
+  });
+
+  it("reads cache-aware compaction settings from plugin config", () => {
+    const config = resolveLcmConfig({}, {
+      cacheAwareCompaction: {
+        enabled: false,
+        maxColdCacheCatchupPasses: 3,
+      },
+    });
+
+    expect(config.cacheAwareCompaction).toEqual({
+      enabled: false,
+      maxColdCacheCatchupPasses: 3,
+    });
+  });
+
+  it("reads dynamic leaf chunk token settings from plugin config", () => {
+    const config = resolveLcmConfig({}, {
+      leafChunkTokens: 24_000,
+      dynamicLeafChunkTokens: {
+        enabled: true,
+        max: 42_000,
+      },
+    });
+
+    expect(config.dynamicLeafChunkTokens).toEqual({
+      enabled: true,
+      max: 42_000,
+    });
+  });
+
+  it("defaults dynamic leaf chunk token max to 2x the static floor", () => {
+    const config = resolveLcmConfig({}, {
+      leafChunkTokens: 24_000,
+    });
+
+    expect(config.dynamicLeafChunkTokens).toEqual({
+      enabled: false,
+      max: 48_000,
+    });
+  });
+
+  it("clamps dynamic leaf chunk token max so it never drops below the static floor", () => {
+    const config = resolveLcmConfig({}, {
+      leafChunkTokens: 24_000,
+      dynamicLeafChunkTokens: {
+        enabled: true,
+        max: 12_000,
+      },
+    });
+
+    expect(config.dynamicLeafChunkTokens).toEqual({
+      enabled: true,
+      max: 24_000,
+    });
   });
 
   it("defaults expansionModel and expansionProvider to empty string", () => {
@@ -324,6 +423,22 @@ describe("resolveLcmConfig", () => {
     expect(manifest.configSchema.properties.leafChunkTokens).toEqual({
       type: "integer",
       minimum: 1,
+    });
+  });
+
+  it("ships a manifest with dynamicLeafChunkTokens in schema", () => {
+    expect(manifest.configSchema.properties.dynamicLeafChunkTokens).toEqual({
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        enabled: {
+          type: "boolean",
+        },
+        max: {
+          type: "integer",
+          minimum: 1,
+        },
+      },
     });
   });
 

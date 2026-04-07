@@ -78,6 +78,35 @@ function ensureSummaryModelColumn(db: DatabaseSync): void {
   }
 }
 
+function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
+  const telemetryColumns = db.prepare(`PRAGMA table_info(conversation_compaction_telemetry)`).all() as SummaryColumnInfo[];
+  const hasLastLeafCompactionAt = telemetryColumns.some((col) => col.name === "last_leaf_compaction_at");
+  const hasTurnsSinceLeafCompaction = telemetryColumns.some((col) => col.name === "turns_since_leaf_compaction");
+  const hasTokensAccumulatedSinceLeafCompaction = telemetryColumns.some(
+    (col) => col.name === "tokens_accumulated_since_leaf_compaction",
+  );
+  const hasLastActivityBand = telemetryColumns.some((col) => col.name === "last_activity_band");
+
+  if (!hasLastLeafCompactionAt) {
+    db.exec(`ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_leaf_compaction_at TEXT`);
+  }
+  if (!hasTurnsSinceLeafCompaction) {
+    db.exec(
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN turns_since_leaf_compaction INTEGER NOT NULL DEFAULT 0`,
+    );
+  }
+  if (!hasTokensAccumulatedSinceLeafCompaction) {
+    db.exec(
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN tokens_accumulated_since_leaf_compaction INTEGER NOT NULL DEFAULT 0`,
+    );
+  }
+  if (!hasLastActivityBand) {
+    db.exec(
+      `ALTER TABLE conversation_compaction_telemetry ADD COLUMN last_activity_band TEXT NOT NULL DEFAULT 'low' CHECK (last_activity_band IN ('low', 'medium', 'high'))`,
+    );
+  }
+}
+
 function backfillSummaryDepths(db: DatabaseSync): void {
   // Leaves are always depth 0, even if legacy rows had malformed values.
   db.exec(`UPDATE summaries SET depth = 0 WHERE kind = 'leaf'`);
@@ -546,6 +575,23 @@ export function runLcmMigrations(
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS conversation_compaction_telemetry (
+      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      last_observed_cache_read INTEGER,
+      last_observed_cache_write INTEGER,
+      last_observed_cache_hit_at TEXT,
+      last_observed_cache_break_at TEXT,
+      cache_state TEXT NOT NULL DEFAULT 'unknown'
+        CHECK (cache_state IN ('hot', 'cold', 'unknown')),
+      retention TEXT,
+      last_leaf_compaction_at TEXT,
+      turns_since_leaf_compaction INTEGER NOT NULL DEFAULT 0,
+      tokens_accumulated_since_leaf_compaction INTEGER NOT NULL DEFAULT 0,
+      last_activity_band TEXT NOT NULL DEFAULT 'low'
+        CHECK (last_activity_band IN ('low', 'medium', 'high')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     -- Indexes
     CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq);
     CREATE INDEX IF NOT EXISTS summaries_conv_created_idx ON summaries (conversation_id, created_at);
@@ -557,6 +603,8 @@ export function runLcmMigrations(
     CREATE INDEX IF NOT EXISTS large_files_conv_idx ON large_files (conversation_id, created_at);
     CREATE INDEX IF NOT EXISTS bootstrap_state_path_idx
       ON conversation_bootstrap_state (session_file_path, updated_at);
+    CREATE INDEX IF NOT EXISTS compaction_telemetry_state_idx
+      ON conversation_compaction_telemetry (cache_state, updated_at);
 
     -- Speed up summary_messages lookups by message_id (PK is summary_id,message_id)
     CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);
@@ -600,6 +648,7 @@ export function runLcmMigrations(
   ensureSummaryDepthColumn(db);
   ensureSummaryMetadataColumns(db);
   ensureSummaryModelColumn(db);
+  ensureCompactionTelemetryColumns(db);
   backfillSummaryDepths(db);
   // Index on depth — created AFTER backfillSummaryDepths to avoid index
   // maintenance overhead during bulk depth updates on large existing DBs.

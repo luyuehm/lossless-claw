@@ -29,3 +29,11 @@ export type {
   UpsertConversationBootstrapStateInput,
   ConversationBootstrapStateRecord,
 } from "./summary-store.js";
+
+export { CompactionTelemetryStore } from "./compaction-telemetry-store.js";
+export type {
+  CacheState,
+  ActivityBand,
+  ConversationCompactionTelemetryRecord,
+  UpsertConversationCompactionTelemetryInput,
+} from "./compaction-telemetry-store.js";

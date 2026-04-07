@@ -100,6 +100,22 @@
       "label": "Custom Instructions",
       "help": "Natural language instructions injected into all summarization prompts (e.g., formatting rules, tone control)"
     },
+    "cacheAwareCompaction.enabled": {
+      "label": "Cache-Aware Compaction",
+      "help": "When enabled, hot prompt cache defers incremental compaction while cold cache allows bounded catch-up passes"
+    },
+    "cacheAwareCompaction.maxColdCacheCatchupPasses": {
+      "label": "Cold Cache Catch-Up Passes",
+      "help": "Maximum incremental leaf passes allowed in one maintenance cycle when prompt cache is cold"
+    },
+    "dynamicLeafChunkTokens.enabled": {
+      "label": "Dynamic Leaf Chunk Tokens",
+      "help": "When enabled, incremental compaction uses a larger working leaf chunk in busy sessions and keeps the static floor in quieter sessions"
+    },
+    "dynamicLeafChunkTokens.max": {
+      "label": "Dynamic Leaf Chunk Max",
+      "help": "Maximum working leaf chunk target for dynamic incremental compaction. The static leafChunkTokens value remains the floor."
+    },
     "timezone": {
       "label": "Timezone",
       "help": "IANA timezone used for summary timestamps"
@@ -227,6 +243,32 @@
       },
       "customInstructions": {
         "type": "string"
+      },
+      "cacheAwareCompaction": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "maxColdCacheCatchupPasses": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "dynamicLeafChunkTokens": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "max": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
       },
       "timezone": {
         "type": "string"
