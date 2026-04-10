@@ -4,7 +4,8 @@ type StartupBannerKey =
   | "fallback-providers"
   | "transcript-gc-enabled"
   | "ignore-session-patterns"
-  | "stateless-session-patterns";
+  | "stateless-session-patterns"
+  | "state-dir";
 
 type StartupBannerLogState = {
   emitted: Set<StartupBannerKey>;
