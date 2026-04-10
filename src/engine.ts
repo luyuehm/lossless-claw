@@ -1305,7 +1305,6 @@ export class LcmContextEngine implements ContextEngine {
         message: `[lcm] Stateless session patterns: ${this.config.statelessSessionPatterns.length} pattern(s): ${this.config.statelessSessionPatterns.join(", ")}`,
       });
     }
-
     this.assembler = new ContextAssembler(
       this.conversationStore,
       this.summaryStore,
@@ -3039,6 +3038,14 @@ export class LcmContextEngine implements ContextEngine {
         bytesFreed: 0,
         rewrittenEntries: 0,
         reason: "stateless session",
+      };
+    }
+    if (!this.config.transcriptGcEnabled) {
+      return {
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: "transcript GC disabled",
       };
     }
     if (typeof params.runtimeContext?.rewriteTranscriptEntries !== "function") {
