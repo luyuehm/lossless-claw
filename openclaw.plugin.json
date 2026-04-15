@@ -365,13 +365,23 @@
         "items": {
           "type": "object",
           "properties": {
-            "provider": { "type": "string" },
-            "model": { "type": "string" }
+            "provider": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
           },
-          "required": ["provider", "model"],
+          "required": [
+            "provider",
+            "model"
+          ],
           "additionalProperties": false
         }
       }
     }
-  }
+  },
+  "name": "Lossless Claw",
+  "description": "Lossless Context Management plugin for OpenClaw",
+  "version": "0.8.0"
 }
