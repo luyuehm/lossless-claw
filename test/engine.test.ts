@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ContextAssembler } from "../src/assembler.js";
 import type { LcmConfig } from "../src/db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection } from "../src/db/connection.js";
-import { LcmContextEngine } from "../src/engine.js";
+import { LcmContextEngine, LOSSLESS_CLAW_CONTEXT_ENGINE_ID } from "../src/engine.js";
 import {
   createDelegatedExpansionGrant,
   getRuntimeExpansionAuthManager,
@@ -265,6 +265,11 @@ afterEach(() => {
 });
 
 describe("LcmContextEngine metadata", () => {
+  it("advertises the registered OpenClaw context engine id", () => {
+    const engine = createEngine();
+    expect(engine.info.id).toBe(LOSSLESS_CLAW_CONTEXT_ENGINE_ID);
+  });
+
   it("advertises ownsCompaction capability", () => {
     const engine = createEngine();
     expect(engine.info.ownsCompaction).toBe(true);

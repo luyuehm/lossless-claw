@@ -88,6 +88,9 @@ type IncrementalCompactionDecision = {
   activityBand: ActivityBand;
   allowCondensedPasses: boolean;
 };
+
+// OpenClaw validates ContextEngine.info.id against the registered engine id.
+export const LOSSLESS_CLAW_CONTEXT_ENGINE_ID = "lossless-claw";
 type DynamicLeafChunkBounds = {
   floor: number;
   medium: number;
@@ -1280,7 +1283,7 @@ export class LcmContextEngine implements ContextEngine {
     // Without a working schema, ownsCompaction would disable the runtime's
     // built-in compaction safeguard and inflate the context budget.
     this.info = {
-      id: "lcm",
+      id: LOSSLESS_CLAW_CONTEXT_ENGINE_ID,
       name: "Lossless Context Management Engine",
       version: "0.1.0",
       ownsCompaction: migrationOk,

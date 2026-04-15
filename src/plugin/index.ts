@@ -10,7 +10,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { resolveLcmConfig, resolveOpenclawStateDir } from "../db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
-import { LcmContextEngine } from "../engine.js";
+import { LcmContextEngine, LOSSLESS_CLAW_CONTEXT_ENGINE_ID } from "../engine.js";
 import { createLcmLogger, describeLogError } from "../lcm-log.js";
 import { logStartupBannerOnce } from "../startup-banner-log.js";
 import { getSharedInit, setSharedInit, removeSharedInit } from "./shared-init.js";
@@ -1835,7 +1835,10 @@ function wirePluginHandlers(
     });
   });
 
-  api.registerContextEngine("lossless-claw", () => shared.getCachedEngine() ?? shared.waitForEngine());
+  api.registerContextEngine(
+    LOSSLESS_CLAW_CONTEXT_ENGINE_ID,
+    () => shared.getCachedEngine() ?? shared.waitForEngine(),
+  );
   api.registerContextEngine("default", () => shared.getCachedEngine() ?? shared.waitForEngine());
 
   api.registerTool((ctx) =>
@@ -1862,7 +1865,7 @@ function wirePluginHandlers(
 }
 
 const lcmPlugin = {
-  id: "lossless-claw",
+  id: LOSSLESS_CLAW_CONTEXT_ENGINE_ID,
   name: "Lossless Context Management",
   description:
     "DAG-based conversation summarization with incremental compaction, full-text search, and sub-agent expansion",
