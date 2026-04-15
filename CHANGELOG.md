@@ -1,5 +1,19 @@
 # @martian-engineering/lossless-claw
 
+## 0.8.1
+
+### Patch Changes
+
+- [#366](https://github.com/Martian-Engineering/lossless-claw/pull/366) [`f4177ec`](https://github.com/Martian-Engineering/lossless-claw/commit/f4177ec9f06af3dbc9da5241288f62e61bcd26c0) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Fix bootstrap recovery when a session rotates to a new transcript file so stale summaries and checkpoints are cleared before re-importing the replacement session history.
+
+- [#353](https://github.com/Martian-Engineering/lossless-claw/pull/353) [`6fa2829`](https://github.com/Martian-Engineering/lossless-claw/commit/6fa2829929c14f0c3175efd59a4df68c0e5b8d45) Thanks [@copilot-swe-agent](https://github.com/apps/copilot-swe-agent)! - Pre-bundle the plugin to `dist/index.js` using esbuild before publishing. This eliminates the per-invocation TypeScript compilation overhead caused by OpenClaw's JITI loader recursively transpiling every `.ts` source file, reducing CLI startup latency from 15–25 s to near-instant.
+
+- [#354](https://github.com/Martian-Engineering/lossless-claw/pull/354) [`b0ad788`](https://github.com/Martian-Engineering/lossless-claw/commit/b0ad78872e3f51fe6b1b1bed0a9c93e8e439554e) Thanks [@copilot-swe-agent](https://github.com/apps/copilot-swe-agent)! - Honor `OPENCLAW_STATE_DIR` for the default database, large-file storage, auth-profile, and legacy secret paths so multi-profile OpenClaw gateways do not read and write each other's state.
+
+- [#371](https://github.com/Martian-Engineering/lossless-claw/pull/371) [`597ec70`](https://github.com/Martian-Engineering/lossless-claw/commit/597ec700f09660aa58899ef6ef3f37d19112e0df) Thanks [@holgergruenhagen](https://github.com/holgergruenhagen)! - Avoid treating omitted LCM summarizer reasoning settings like reasoning-disabled requests for reasoning-capable models by applying a low default only when the resolved model supports reasoning.
+
+- [#377](https://github.com/Martian-Engineering/lossless-claw/pull/377) [`3b2d34c`](https://github.com/Martian-Engineering/lossless-claw/commit/3b2d34c4e68601e37ce3b012bb38ae4ca5e977af) Thanks [@100yenadmin](https://github.com/100yenadmin)! - Add an opt-in `transcriptGcEnabled` config flag, defaulting it to `false`, and skip transcript-GC rewrites during `maintain()` unless the flag is enabled. Also add startup diagnostics and documentation for the new setting.
+
 ## 0.8.0
 
 ### Minor Changes
