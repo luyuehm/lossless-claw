@@ -7578,7 +7578,21 @@ export class LcmContextEngine implements ContextEngine {
     forkSourceMessageCount?: number;
   }): Promise<void> {
     const latestDbMessage = await this.conversationStore.getLastMessage(params.conversationId);
-    const fileStats = params.fileStats ?? (await stat(params.sessionFile));
+    // The host may prune transient cron/session JSONL files before afterTurn
+    // checkpoint refresh runs. In that case there is no transcript EOF to
+    // anchor, and the DB frontier has already been updated, so skip the
+    // checkpoint refresh silently instead of emitting recurring ENOENT noise.
+    let fileStats = params.fileStats;
+    if (!fileStats) {
+      try {
+        fileStats = await stat(params.sessionFile);
+      } catch (err) {
+        if (isMissingFileError(err)) {
+          return;
+        }
+        throw err;
+      }
+    }
     await this.summaryStore.upsertConversationBootstrapState({
       conversationId: params.conversationId,
       sessionFilePath: params.sessionFile,
