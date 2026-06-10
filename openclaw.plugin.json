@@ -1,5 +1,6 @@
 {
   "id": "lossless-claw",
+  "version": "0.12.1-fork.1",
   "name": "Lossless Context Management",
   "kind": "context-engine",
   "activation": {

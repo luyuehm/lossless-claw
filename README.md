@@ -2,6 +2,8 @@
 
 Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/openclaw), based on the [LCM paper](https://papers.voltropy.com/LCM) from [Voltropy](https://x.com/Voltropy). Replaces OpenClaw's built-in sliding-window compaction with a DAG-based summarization system that preserves every message while keeping active context within model token limits.
 
+> **Fork by [@luyuehm](https://github.com/luyuehm/lossless-claw)** — tracking upstream v0.12.0 with an additional fix and OpenClaw 2026.6.5 compatibility verification.
+
 ## Table of contents
 
 - [What it does](#what-it-does)
