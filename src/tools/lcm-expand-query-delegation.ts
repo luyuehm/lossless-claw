@@ -225,6 +225,7 @@ function buildDelegatedExpandQueryTask(params: {
     '  "truncated": false',
     "}",
     "",
+    "Output contract: do NOT output markdown fences, code blocks, or any explanatory text before or after the JSON. Start directly with { and end with }.",
     "Rules:",
     "- In delegated context, call `lcm_expand` directly for source retrieval.",
     "- DO NOT call `lcm_expand_query` from this delegated session.",
@@ -246,6 +247,56 @@ function formatInvalidDelegatedReply(reply: string, reason: string): string {
   return `Delegated expansion query returned ${reason}: ${snippet}`;
 }
 
+// Recover complete, balanced JSON objects embedded in prose. The delegated
+// child may precede or follow the JSON contract with thinking/analysis text, so
+// scan each '{' as a potential object start and walk forward tracking string
+// literals — a '{' or '}' inside a string value (e.g. a cited summary excerpt)
+// must not unbalance the walk. Each recovered block is still validated with
+// JSON.parse by the caller.
+function extractEmbeddedJsonObjects(text: string): string[] {
+  const objects: string[] = [];
+  for (let index = 0; index < text.length; ) {
+    const start = text.indexOf("{", index);
+    if (start === -1) {
+      break;
+    }
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let end = -1;
+    for (let cursor = start; cursor < text.length; cursor += 1) {
+      const ch = text[cursor];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === "\\") {
+          escaped = true;
+        } else if (ch === '"') {
+          inString = false;
+        }
+        continue;
+      }
+      if (ch === '"') {
+        inString = true;
+      } else if (ch === "{") {
+        depth += 1;
+      } else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          end = cursor;
+          break;
+        }
+      }
+    }
+    if (end === -1) {
+      break;
+    }
+    objects.push(text.slice(start, end + 1));
+    index = end + 1;
+  }
+  return objects;
+}
+
 // Validate the untrusted child reply before using it in the public tool result.
 function parseDelegatedExpandQueryReply(
   rawReply: string,
@@ -256,6 +307,11 @@ function parseDelegatedExpandQueryReply(
   const fenced = reply.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fenced?.[1]) {
     candidates.unshift(fenced[1].trim());
+  }
+  // If the direct/fenced parse fails, try the first complete JSON object the
+  // child embedded in otherwise free-form text.
+  for (const embedded of extractEmbeddedJsonObjects(reply)) {
+    candidates.push(embedded);
   }
 
   for (const candidate of candidates) {

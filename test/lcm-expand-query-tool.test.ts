@@ -159,6 +159,57 @@ function makeEngine(params: {
   } as unknown as LcmContextEngine;
 }
 
+// Make the delegated child return a specific raw assistant reply, then run the
+// tool in single-conversation mode so it hits runDelegatedExpandQuery.
+async function executeDelegatedWithReply(rawReply: string) {
+  const retrieval = makeRetrieval();
+  retrieval.describe.mockResolvedValue({
+    type: "summary",
+    summary: { conversationId: 42 },
+  });
+
+  callGatewayMock.mockImplementation(async (opts: unknown) => {
+    const request = opts as { method?: string };
+    if (request.method === "agent") {
+      return { runId: "run-reply" };
+    }
+    if (request.method === "agent.wait") {
+      return { status: "ok" };
+    }
+    if (request.method === "sessions.get") {
+      return {
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "text",
+                text: rawReply,
+              },
+            ],
+          },
+        ],
+      };
+    }
+    if (request.method === "sessions.delete") {
+      return { ok: true };
+    }
+    return {};
+  });
+
+  const tool = createLcmExpandQueryTool({
+    deps: makeDeps(),
+    lcm: makeEngine({ retrieval }),
+    sessionId: "agent:main:main",
+    requesterSessionKey: "agent:main:main",
+  });
+  return await tool.execute("call-reply", {
+    summaryIds: ["sum_a"],
+    prompt: "What caused the outage?",
+    conversationId: 42,
+  });
+}
+
 describe("createLcmExpandQueryTool", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -597,6 +648,117 @@ describe("createLcmExpandQueryTool", () => {
     expect(result.details).toMatchObject({
       error: expect.stringContaining('JSON without a non-empty "answer"'),
     });
+  });
+
+  it("parses a delegated reply with prose before the JSON contract", async () => {
+    const result = await executeDelegatedWithReply(
+      'I will first describe the seed summaries and then call lcm_grep. {"answer":"Root cause is the stale token.","citedIds":["sum_a"],"expandedSummaryCount":1,"totalSourceTokens":45000,"truncated":false}',
+    );
+    expect(result.details).toMatchObject({
+      answer: "Root cause is the stale token.",
+      citedIds: ["sum_a"],
+      sourceConversationId: 42,
+      expandedSummaryCount: 1,
+      totalSourceTokens: 45000,
+      truncated: false,
+    });
+  });
+
+  it("parses a delegated reply with prose after the JSON contract", async () => {
+    const result = await executeDelegatedWithReply(
+      '{"answer":"The flag is behind a canary.","citedIds":["sum_b"],"expandedSummaryCount":2,"totalSourceTokens":30000,"truncated":true} I decided that the second branch was too costly to expand.',
+    );
+    expect(result.details).toMatchObject({
+      answer: "The flag is behind a canary.",
+      citedIds: ["sum_b"],
+      sourceConversationId: 42,
+      expandedSummaryCount: 2,
+      totalSourceTokens: 30000,
+      truncated: true,
+    });
+  });
+
+  it("keeps braces inside JSON string values from derailing extraction", async () => {
+    const result = await executeDelegatedWithReply(
+      'The traced exception looked like {"answer":"Summary for {sum_x} showed token weight {z}.","citedIds":["sum_c"],"expandedSummaryCount":1,"totalSourceTokens":12000,"truncated":false}',
+    );
+    expect(result.details).toMatchObject({
+      answer: "Summary for {sum_x} showed token weight {z}.",
+    });
+  });
+
+  it("falls back to the first embedded JSON object when the whole reply is not parseable", async () => {
+    const result = await executeDelegatedWithReply(
+      'Let me start by inspecting. {"answer":"A cold db path caused refetch.","citedIds":["sum_d"],"expandedSummaryCount":1,"totalSourceTokens":9000,"truncated":false}  Then another {"answer":"ignored","citedIds":["sum_e"]}',
+    );
+    expect(result.details).toMatchObject({
+      answer: "A cold db path caused refetch.",
+      citedIds: ["sum_d"],
+      expandedSummaryCount: 1,
+      totalSourceTokens: 9000,
+    });
+  });
+
+  it("records the delegated output contract in the child task prompt", async () => {
+    const retrieval = makeRetrieval();
+    retrieval.describe.mockResolvedValue({
+      type: "summary",
+      summary: { conversationId: 42 },
+    });
+
+    let delegatedMessage = "";
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string; params?: Record<string, unknown> };
+      if (request.method === "agent") {
+        delegatedMessage = String(request.params?.message ?? "");
+        return { runId: "run-prompt" };
+      }
+      if (request.method === "agent.wait") {
+        return { status: "ok" };
+      }
+      if (request.method === "sessions.get") {
+        return {
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    answer: "done",
+                    citedIds: ["sum_a"],
+                    expandedSummaryCount: 1,
+                    totalSourceTokens: 100,
+                    truncated: false,
+                  }),
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (request.method === "sessions.delete") {
+        return { ok: true };
+      }
+      return {};
+    });
+
+    const tool = createLcmExpandQueryTool({
+      deps: makeDeps(),
+      lcm: makeEngine({ retrieval }),
+      sessionId: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+    });
+    await tool.execute("call-prompt", {
+      summaryIds: ["sum_a"],
+      prompt: "what happened",
+      conversationId: 42,
+    });
+
+    expect(delegatedMessage).toContain(
+      "do NOT output markdown fences, code blocks, or any explanatory text",
+    );
+    expect(delegatedMessage).toContain("Start directly with { and end with }.");
   });
 
   it("returns a validation error when prompt is missing", async () => {
