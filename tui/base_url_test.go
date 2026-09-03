@@ -47,6 +47,17 @@ func TestResolveProviderBaseURLFallsBackToProviderDefaults(t *testing.T) {
 	}
 }
 
+func TestResolveProviderBaseURLMiniMaxRegionalDefaults(t *testing.T) {
+	paths := appDataPaths{}
+
+	if got := resolveProviderBaseURL(paths, miniMaxProviderID, ""); got != defaultMiniMaxBaseURL {
+		t.Fatalf("expected global MiniMax default %q, got %q", defaultMiniMaxBaseURL, got)
+	}
+	if got := resolveProviderBaseURL(paths, miniMaxCNProviderID, ""); got != defaultMiniMaxCNBaseURL {
+		t.Fatalf("expected China MiniMax default %q, got %q", defaultMiniMaxCNBaseURL, got)
+	}
+}
+
 func TestResolveInteractiveRewriteProviderModelUsesTUISummaryBaseURL(t *testing.T) {
 	t.Setenv("LCM_TUI_SUMMARY_PROVIDER", "openai")
 	t.Setenv("LCM_TUI_SUMMARY_MODEL", "gpt-5.3-codex")
@@ -114,6 +125,13 @@ func TestResolveTUISummaryRuntimeSettingsUsesTUIEnvBeforeLegacyEnv(t *testing.T)
 }
 
 func TestResolveTUISummaryRuntimeSettingsUsesDoctorDefaults(t *testing.T) {
+	t.Setenv("LCM_TUI_SUMMARY_PROVIDER", "")
+	t.Setenv("LCM_TUI_SUMMARY_MODEL", "")
+	t.Setenv("LCM_TUI_SUMMARY_BASE_URL", "")
+	t.Setenv("LCM_SUMMARY_PROVIDER", "")
+	t.Setenv("LCM_SUMMARY_MODEL", "")
+	t.Setenv("LCM_SUMMARY_BASE_URL", "")
+
 	settings := resolveTUISummaryRuntimeSettings(appDataPaths{}, "", "", "", doctorDefaultProvider, doctorDefaultModel)
 	if settings.provider != doctorDefaultProvider {
 		t.Fatalf("expected doctor default provider %q, got %q", doctorDefaultProvider, settings.provider)

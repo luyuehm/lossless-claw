@@ -27,8 +27,9 @@ export type {
   SummaryMessageSeqRangeRecord,
   CreateLargeFileInput,
   LargeFileRecord,
-  UpsertConversationBootstrapStateInput,
-  ConversationBootstrapStateRecord,
+
+  LargeFileSearchInput,
+  LargeFileSearchResult,
 } from "./summary-store.js";
 
 export { CompactionTelemetryStore } from "./compaction-telemetry-store.js";

@@ -8,7 +8,7 @@ LCM provides four tools for agents to search, inspect, and recall information fr
 
 Most recall tasks follow this escalation:
 
-1. **`lcm_grep`** — Find relevant summaries or messages by keyword/regex
+1. **`lcm_grep`** — Find relevant summaries, messages, or externalized file prefixes by keyword/regex
 2. **`lcm_describe`** — Inspect a specific summary's full content (cheap, no sub-agent)
 3. **`lcm_expand_query`** — Deep recall: spawn a sub-agent to expand the DAG and answer a focused question
 
@@ -30,7 +30,7 @@ Summaries are lossy by design. The "Expand for details about:" footer at the end
 
 ### lcm_grep
 
-Search across messages and/or summaries using regex or full-text search.
+Search across messages, summaries, and/or the bounded prefix of externalized large files using regex or full-text search.
 
 Use `mode: "full_text"` for keyword or topical recall. Full-text queries are not regexes: alternation (`A|B`), regex wildcards (`.*`), character classes (`[abc]`), and anchors (`^foo`, `foo$`) require `mode: "regex"`. Wrap exact multi-word phrases in quotes to preserve phrase matching. Keep the default `sort: "recency"` for recent events, switch to `sort: "relevance"` when looking for the best older match on a topic, and use `sort: "hybrid"` when you want relevance without giving up recency entirely.
 
@@ -40,7 +40,8 @@ Use `mode: "full_text"` for keyword or topical recall. Full-text queries are not
 |-------|------|----------|---------|-------------|
 | `pattern` | string | ✅ | — | Search pattern |
 | `mode` | string | | `"regex"` | `"regex"` or `"full_text"` |
-| `scope` | string | | `"both"` | `"messages"`, `"summaries"`, or `"both"` |
+| `scope` | string | | `"both"` | `"messages"`, `"summaries"`, `"both"`, or `"files"` |
+| `fileIds` | string[] | | — | Optional `file_xxx` IDs to restrict `scope: "files"` searches |
 | `conversationId` | number | | current session family | Specific physical conversation to search |
 | `allConversations` | boolean | | `false` | Search all conversations |
 | `since` | string | | — | ISO timestamp lower bound |
@@ -49,12 +50,13 @@ Use `mode: "full_text"` for keyword or topical recall. Full-text queries are not
 | `sort` | string | | `"recency"` | `"recency"`, `"relevance"`, or `"hybrid"` for full-text ranking |
 
 **Returns:** Array of matches with:
-- `id` — Message or summary ID
-- `type` — `"message"` or `"summary"`
+- `id` — Message, summary, or file ID
+- `type` — `"message"`, `"summary"`, or `"file"`
 - `snippet` — Truncated content around the match
 - `conversationId` — Which conversation
 - `createdAt` — Timestamp
 - For summaries: `depth`, `kind`, `summaryId`
+- For files: line number, byte offset, matched text, and a snippet from the first 512,000 bytes scanned per file
 
 **Examples:**
 
@@ -70,6 +72,9 @@ lcm_grep(pattern: "config\\.threshold.*0\\.[0-9]+", scope: "summaries")
 
 # Recent messages containing a specific term
 lcm_grep(pattern: "deployment", since: "2026-02-19T00:00:00Z", scope: "messages")
+
+# Search the bounded scanned prefix of an externalized file
+lcm_grep(pattern: "CRITICAL_MARKER", scope: "files", fileIds: ["file_789abc012345"])
 ```
 
 ### lcm_describe
@@ -95,7 +100,7 @@ Look up metadata and content for a specific summary or stored file.
 - File IDs referenced in the summary
 
 **Returns for files:**
-- File content (full text)
+- File content, capped by `expandFileMaxBytes`
 - Metadata: fileName, mimeType, byteSize
 - Exploration summary
 - Storage path
@@ -114,7 +119,7 @@ lcm_describe(id: "file_789abc012345")
 
 Answer a focused question by expanding summaries through the DAG. Spawns a bounded sub-agent that walks parent links down to source material and returns a compact answer.
 
-When `allConversations: true` is set, `lcm_expand_query` can now synthesize one answer across multiple conversations. That cross-conversation mode is bounded, not exhaustive: it ranks conversation buckets, expands only the top few, and marks the result truncated when lower-ranked buckets are skipped or fail.
+When `allConversations: true` is set, `lcm_expand_query` can synthesize one answer across multiple conversations. That cross-conversation mode is bounded, not exhaustive: it ranks conversation buckets, expands only the top few under one shared deadline, and marks the result truncated when lower-ranked buckets are skipped or fail. The selected buckets share the existing `tokenCap`, so concurrent recall does not multiply the retrieval budget.
 
 **Parameters:**
 
@@ -136,8 +141,10 @@ When `allConversations: true` is set, `lcm_expand_query` can now synthesize one 
 - `sourceConversationIds` — Conversations that were successfully expanded
 - `expandedSummaryCount` — How many summaries were expanded
 - `totalSourceTokens` — Total tokens read from the DAG
-- `truncated` — Whether the answer was truncated to fit maxTokens
+- `truncated` — Whether source expansion was truncated or any selected conversation was skipped or failed
 - `conversationBreakdown` — Optional per-conversation success/failure diagnostics for bounded multi-conversation runs
+
+Successful single-conversation results keep the response shape above. When delegated recall fails, the result keeps the human-readable `error` and adds `errorCode`, empty source counters, and a `conversationBreakdown`. Failed entries identify the conversation, attempted summary IDs, failure phase, elapsed time, and error code. Timed-out child work is cancelled through the host-owned temporary-session cleanup path. Completed conversation buckets still contribute evidence when another bucket times out; timed-out buckets do not contribute guessed answer text or citations.
 
 **Examples:**
 

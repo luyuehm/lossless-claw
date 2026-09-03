@@ -7,11 +7,29 @@ import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-
 import { buildMessageIdentityHash } from "./message-identity.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
 import { buildFtsOrderBy, type SearchSort } from "./full-text-sort.js";
+import { compileSafeSearchRegex } from "./search-regex.js";
+import type { TranscriptAnchorAuditMessage } from "../transcript-anchor-audit.js";
+import {
+  parseOpenClawSenderMetadata,
+  serializeOpenClawSenderMetadata,
+  type OpenClawSenderMetadata,
+} from "../openclaw-sender-metadata.js";
 
 export type ConversationId = number;
 export type MessageId = number;
 export type SummaryId = string;
 export type MessageRole = "system" | "user" | "assistant" | "tool";
+export type TranscriptAnchorTrustState =
+  | "verified"
+  | "repaired"
+  | "suspect"
+  | "legacy_prefix"
+  | "unproven";
+export type ConversationTranscriptEpochMode =
+  | "verified"
+  | "repairable"
+  | "legacy_prefix"
+  | "corrupt";
 export type MessagePartType =
   | "text"
   | "reasoning"
@@ -32,7 +50,28 @@ export type CreateMessageInput = {
   role: MessageRole;
   content: string;
   tokenCount: number;
+  /** Allowlisted OpenClaw sender identity for group-message replay. */
+  openClawSenderMetadata?: OpenClawSenderMetadata | null;
   identityHash?: string;
+  /**
+   * Optional historical message timestamp, used by transcript recovery imports.
+   * Runtime ingests omit this and keep the store's current timestamp behavior.
+   */
+  createdAt?: Date | string;
+  /**
+   * Stable JSONL envelope id of the transcript entry this message was
+   * imported from. Enforced unique per conversation (partial index), so
+   * transcript replays cannot duplicate rows. Null/undefined for runtime
+   * ingests and envelope-less transcripts.
+   */
+  transcriptEntryId?: string | null;
+  /**
+   * Cross-representation stable event identity (responseId or provider-minted
+   * toolCallId) used to short-circuit duplicate ingestion when the transcript
+   * and live runtime batch describe the same semantic event.
+   * Null/undefined preserves the existing behavior.
+   */
+  stableEventKey?: string | null;
   // Use only when the caller is intentionally importing a fresh transcript epoch.
   skipReplayTimestampFloodGuard?: boolean;
 };
@@ -40,6 +79,7 @@ export type CreateMessageInput = {
 type PreparedMessageInsert = CreateMessageInput & {
   createdAt: string;
   identityHash: string;
+  stableEventKey: string | null;
 };
 
 type ExternalReplayFloodGroup = {
@@ -78,6 +118,70 @@ export type MessageRecord = {
    * compact `[LCM Tool Output: file_xxx | …]` reference.
    */
   largeContent: string | null;
+  /**
+   * Transcript provenance: non-null only when the row was imported from a
+   * transcript envelope written by the host's own flush — a marker a user
+   * cannot forge. Covered-frontier dedup requires it before a metadata-body
+   * match may support alignment; an independent replay anchor is still
+   * required before collapse.
+   */
+  transcriptEntryId: string | null;
+  /** Allowlisted OpenClaw sender identity, or null for legacy/direct messages. */
+  openClawSenderMetadata: OpenClawSenderMetadata | null;
+};
+
+export type MessageTranscriptAnchorTrustRecord = {
+  messageId: MessageId;
+  conversationId: ConversationId;
+  transcriptEntryId: string | null;
+  trustState: TranscriptAnchorTrustState;
+  source: string;
+  reason: string | null;
+  verifiedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+export type UpsertMessageTranscriptAnchorTrustInput = {
+  messageId: MessageId;
+  conversationId: ConversationId;
+  transcriptEntryId?: string | null;
+  trustState: TranscriptAnchorTrustState;
+  source: string;
+  reason?: string | null;
+  verifiedAt?: Date | string | null;
+};
+
+export type ConversationTranscriptEpochRecord = {
+  conversationId: ConversationId;
+  sessionId: string;
+  sessionKey: string | null;
+  frontierEntryId: string | null;
+  frontierSeq: number | null;
+  frontierCreatedAt: Date | null;
+  migrationMode: ConversationTranscriptEpochMode;
+  metadata: unknown;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+export type TranscriptEntryAnchorCandidate = {
+  messageId: MessageId;
+  conversationId: ConversationId;
+  transcriptEntryId: string;
+  role: MessageRole;
+  content: string;
+};
+
+export type UpsertConversationTranscriptEpochInput = {
+  conversationId: ConversationId;
+  sessionId: string;
+  sessionKey?: string | null;
+  frontierEntryId?: string | null;
+  frontierSeq?: number | null;
+  frontierCreatedAt?: Date | string | null;
+  migrationMode: ConversationTranscriptEpochMode;
+  metadata?: unknown;
 };
 
 export type CreateMessagePartInput = {
@@ -126,6 +230,21 @@ export type ConversationRecord = {
   updatedAt: Date;
 };
 
+/** Normalized provenance for a conversation archive, set at the archive funnel. */
+export type ArchiveCause =
+  | "manual-reset"
+  | "session-deleted"
+  | "session-end"
+  | "rollover-fallback"
+  | "cron-rotation";
+
+// Causes the rollover-split doctor must never auto-restore. Ships with
+// `manual-reset` only: a deliberate operator wipe is rock-solid intent. The other
+// causes are recorded but stay merge-eligible because the safe direction is
+// over-restore (today's behavior); promoting `session-deleted` once the host
+// deletion contract is confirmed is a one-line follow-up.
+export const DELIBERATE_ARCHIVE_CAUSES: ReadonlySet<ArchiveCause> = new Set(["manual-reset"]);
+
 export type MessageSearchInput = {
   conversationId?: ConversationId;
   conversationIds?: ConversationId[];
@@ -145,6 +264,11 @@ export type MessageSearchResult = {
   createdAt: Date;
   rank?: number;
 };
+
+export type RecentStaleTranscriptEntryMatch =
+  | { status: "found"; messageId: number; transcriptEntryId: string }
+  | { status: "ambiguous" }
+  | { status: "none" };
 
 // ── DB row shapes (snake_case) ────────────────────────────────────────────────
 
@@ -171,6 +295,44 @@ interface MessageRow {
   // v4.2 §B — sidecar fileId column. Optional in row shape because not
   // every SELECT projects it; mappers tolerate undefined → null.
   large_content?: string | null;
+  // Transcript provenance: non-null only for rows imported from a transcript
+  // envelope (the host's own flush). Same optional-projection tolerance.
+  transcript_entry_id?: string | null;
+  // Allowlisted OpenClaw sender envelope fields, serialized as JSON.
+  openclaw_sender_metadata?: string | null;
+}
+
+interface MessageTranscriptAnchorTrustRow {
+  message_id: number;
+  conversation_id: number;
+  transcript_entry_id: string | null;
+  trust_state: TranscriptAnchorTrustState;
+  source: string;
+  reason: string | null;
+  verified_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface ConversationTranscriptEpochRow {
+  conversation_id: number;
+  session_id: string;
+  session_key: string | null;
+  frontier_entry_id: string | null;
+  frontier_seq: number | null;
+  frontier_created_at: string | null;
+  migration_mode: ConversationTranscriptEpochMode;
+  metadata_json: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface TranscriptEntryAnchorCandidateRow {
+  message_id: number;
+  conversation_id: number;
+  transcript_entry_id: string;
+  role: MessageRole;
+  content: string;
 }
 
 interface MessageSearchRow {
@@ -224,9 +386,31 @@ function toConversationRecord(row: ConversationRow): ConversationRecord {
   };
 }
 
+function formatMessageCreatedAt(value: Date | string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value instanceof Date) {
+    return Number.isFinite(value.getTime())
+      ? value.toISOString().slice(0, 19).replace("T", " ")
+      : undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const parsed = parseUtcTimestampOrNull(trimmed);
+  if (parsed && Number.isFinite(parsed.getTime())) {
+    return parsed.toISOString().slice(0, 19).replace("T", " ");
+  }
+  return undefined;
+}
+
 function toMessageRecord(row: MessageRow): MessageRecord {
   return {
     largeContent: row.large_content ?? null,
+    transcriptEntryId: row.transcript_entry_id ?? null,
+    openClawSenderMetadata: parseOpenClawSenderMetadata(row.openclaw_sender_metadata),
     messageId: row.message_id,
     conversationId: row.conversation_id,
     seq: row.seq,
@@ -234,6 +418,73 @@ function toMessageRecord(row: MessageRow): MessageRecord {
     content: row.content,
     tokenCount: row.token_count,
     createdAt: parseUtcTimestamp(row.created_at),
+  };
+}
+
+function formatNullableTimestamp(value: Date | string | null | undefined): string | null {
+  if (value == null) {
+    return null;
+  }
+  if (value instanceof Date) {
+    return Number.isFinite(value.getTime()) ? value.toISOString() : null;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function parseMetadataJson(value: string | null): unknown {
+  if (value == null || value.trim() === "") {
+    return null;
+  }
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function toMessageTranscriptAnchorTrustRecord(
+  row: MessageTranscriptAnchorTrustRow,
+): MessageTranscriptAnchorTrustRecord {
+  return {
+    messageId: row.message_id,
+    conversationId: row.conversation_id,
+    transcriptEntryId: row.transcript_entry_id,
+    trustState: row.trust_state,
+    source: row.source,
+    reason: row.reason,
+    verifiedAt: parseUtcTimestampOrNull(row.verified_at),
+    createdAt: parseUtcTimestamp(row.created_at),
+    updatedAt: parseUtcTimestamp(row.updated_at),
+  };
+}
+
+function toConversationTranscriptEpochRecord(
+  row: ConversationTranscriptEpochRow,
+): ConversationTranscriptEpochRecord {
+  return {
+    conversationId: row.conversation_id,
+    sessionId: row.session_id,
+    sessionKey: row.session_key,
+    frontierEntryId: row.frontier_entry_id,
+    frontierSeq: row.frontier_seq,
+    frontierCreatedAt: parseUtcTimestampOrNull(row.frontier_created_at),
+    migrationMode: row.migration_mode,
+    metadata: parseMetadataJson(row.metadata_json),
+    createdAt: parseUtcTimestamp(row.created_at),
+    updatedAt: parseUtcTimestamp(row.updated_at),
+  };
+}
+
+function toTranscriptEntryAnchorCandidate(
+  row: TranscriptEntryAnchorCandidateRow,
+): TranscriptEntryAnchorCandidate {
+  return {
+    messageId: row.message_id,
+    conversationId: row.conversation_id,
+    transcriptEntryId: row.transcript_entry_id,
+    role: row.role,
+    content: row.content,
   };
 }
 
@@ -264,7 +515,8 @@ function toMessagePartRecord(row: MessagePartRow): MessagePartRecord {
   };
 }
 
-function normalizeMessageContentForFullTextIndex(content: string): string | null {
+/** Normalize persisted message text before indexing it in the message FTS table. */
+export function normalizeMessageContentForFullTextIndex(content: string): string | null {
   if (typeof content !== "string") return null;
   const trimmed = content.trim();
   if (!trimmed) {
@@ -314,6 +566,10 @@ export class ConversationStore {
   private readonly fts5Available: boolean;
   private readonly replayFloodThresholdExternal: number;
   private readonly replayFloodThresholdInternal: number;
+  private readonly onStableEventKeyConflict?: (info: {
+    conversationId: ConversationId;
+    stableEventKey: string;
+  }) => void;
 
   constructor(
     private db: DatabaseSync,
@@ -331,11 +587,17 @@ export class ConversationStore {
        * calls returning identical results within the same SQLite-second).
        */
       replayFloodThresholdInternal?: number;
+      /** Report when a colliding stable key must be dropped to preserve a row. */
+      onStableEventKeyConflict?: (info: {
+        conversationId: ConversationId;
+        stableEventKey: string;
+      }) => void;
     },
   ) {
     this.fts5Available = options?.fts5Available ?? true;
     this.replayFloodThresholdExternal = options?.replayFloodThresholdExternal ?? 3;
     this.replayFloodThresholdInternal = options?.replayFloodThresholdInternal ?? 32;
+    this.onStableEventKeyConflict = options?.onStableEventKeyConflict;
   }
 
   // ── Transaction helpers ──────────────────────────────────────────────────
@@ -577,19 +839,97 @@ export class ConversationStore {
       .run(conversationId);
   }
 
-  async archiveConversation(conversationId: ConversationId): Promise<void> {
+  // Single archive funnel: deliberate archives must flow through here with their
+  // cause. The direct-insert archived-row path (createConversation active:false)
+  // leaves archive_cause NULL = merge-eligible by design.
+  async archiveConversation(conversationId: ConversationId, cause: ArchiveCause): Promise<void> {
     this.db
       .prepare(
         `UPDATE conversations
        SET active = 0,
            archived_at = COALESCE(archived_at, datetime('now')),
+           archive_cause = COALESCE(archive_cause, ?),
            updated_at = datetime('now')
        WHERE conversation_id = ?`,
       )
-      .run(conversationId);
+      .run(cause, conversationId);
+  }
+
+  async rebindConversationSession(
+    conversationId: ConversationId,
+    sessionId: string,
+    sessionKey?: string | null,
+  ): Promise<ConversationRecord | null> {
+    const normalizedSessionId = sessionId.trim();
+    const normalizedSessionKey = sessionKey?.trim() || null;
+    if (!normalizedSessionId) {
+      return this.getConversation(conversationId);
+    }
+    this.db
+      .prepare(
+        `UPDATE conversations
+         SET session_id = ?,
+             session_key = COALESCE(?, session_key),
+             active = 1,
+             archived_at = NULL,
+             updated_at = datetime('now')
+         WHERE conversation_id = ?`,
+      )
+      .run(normalizedSessionId, normalizedSessionKey, conversationId);
+    return this.getConversation(conversationId);
   }
 
   // ── Message operations ────────────────────────────────────────────────────
+
+  /**
+   * Insert one prepared row, retrying without its stable key when the unique
+   * identity assumption is violated. The row remains durable while later
+   * dedup becomes conservative, which is the lossless failure direction.
+   */
+  private runMessageInsert(prepared: PreparedMessageInsert): number {
+    const insert = (stableEventKey: string | null): number => {
+      const result = this.db
+        .prepare(
+          `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, openclaw_sender_metadata, transcript_entry_id, stable_event_key, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          prepared.conversationId,
+          prepared.seq,
+          prepared.role,
+          prepared.content,
+          prepared.tokenCount,
+          prepared.identityHash,
+          serializeOpenClawSenderMetadata(prepared.openClawSenderMetadata),
+          prepared.transcriptEntryId ?? null,
+          stableEventKey,
+          prepared.createdAt,
+        );
+      return Number(result.lastInsertRowid);
+    };
+
+    if (prepared.stableEventKey == null) {
+      return insert(null);
+    }
+    try {
+      return insert(prepared.stableEventKey);
+    } catch (error: unknown) {
+      const isStableKeyConflict =
+        error instanceof Error &&
+        /UNIQUE constraint failed|SQLITE_CONSTRAINT_UNIQUE/i.test(error.message) &&
+        error.message.includes("stable_event_key");
+      if (!isStableKeyConflict) {
+        throw error;
+      }
+
+      const messageId = insert(null);
+      this.onStableEventKeyConflict?.({
+        conversationId: prepared.conversationId,
+        stableEventKey: prepared.stableEventKey,
+      });
+      return messageId;
+    }
+  }
 
   async createMessage(input: CreateMessageInput): Promise<MessageRecord> {
     const prepared = this.prepareMessageInsert(input);
@@ -597,28 +937,13 @@ export class ConversationStore {
       this.assertNoReplayTimestampFlood([prepared]);
     }
 
-    const result = this.db
-      .prepare(
-        `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        prepared.conversationId,
-        prepared.seq,
-        prepared.role,
-        prepared.content,
-        prepared.tokenCount,
-        prepared.identityHash,
-        prepared.createdAt,
-      );
-
-    const messageId = Number(result.lastInsertRowid);
+    const messageId = this.runMessageInsert(prepared);
 
     this.indexMessageForFullText(messageId, input.content);
 
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
        FROM messages WHERE message_id = ?`,
       )
       .get(messageId) as unknown as MessageRow;
@@ -636,28 +961,14 @@ export class ConversationStore {
       preparedInputs.filter((input) => !input.skipReplayTimestampFloodGuard),
     );
 
-    const insertStmt = this.db.prepare(
-      `INSERT INTO messages (conversation_id, seq, role, content, token_count, identity_hash, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    );
     const selectStmt = this.db.prepare(
-      `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+      `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
        FROM messages WHERE message_id = ?`,
     );
 
     const records: MessageRecord[] = [];
     for (const input of preparedInputs) {
-      const result = insertStmt.run(
-        input.conversationId,
-        input.seq,
-        input.role,
-        input.content,
-        input.tokenCount,
-        input.identityHash,
-        input.createdAt,
-      );
-
-      const messageId = Number(result.lastInsertRowid);
+      const messageId = this.runMessageInsert(input);
       this.indexMessageForFullText(messageId, input.content);
       const row = selectStmt.get(messageId) as unknown as MessageRow;
       records.push(toMessageRecord(row));
@@ -676,7 +987,7 @@ export class ConversationStore {
     if (limit != null) {
       const rows = this.db
         .prepare(
-          `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+          `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
          FROM messages
          WHERE conversation_id = ? AND seq > ?
          ORDER BY seq
@@ -688,7 +999,7 @@ export class ConversationStore {
 
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
        FROM messages
        WHERE conversation_id = ? AND seq > ?
        ORDER BY seq`,
@@ -697,10 +1008,66 @@ export class ConversationStore {
     return rows.map(toMessageRecord);
   }
 
+  /** Return persisted messages in the shape consumed by transcript anchor audit. */
+  async listTranscriptAnchorAuditMessages(
+    conversationId: ConversationId,
+  ): Promise<TranscriptAnchorAuditMessage[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT
+           m.message_id,
+           m.seq,
+           m.role,
+           m.content,
+           m.transcript_entry_id,
+           t.trust_state,
+           m.created_at
+         FROM messages m
+         LEFT JOIN message_transcript_anchor_trust t ON t.message_id = m.message_id
+         WHERE m.conversation_id = ?
+         ORDER BY m.seq`,
+      )
+      .all(conversationId) as Array<{
+      message_id: number;
+      seq: number;
+      role: MessageRole;
+      content: string;
+      transcript_entry_id: string | null;
+      trust_state: TranscriptAnchorTrustState | null;
+      created_at: string;
+    }>;
+    return rows.map((row) => ({
+      messageId: row.message_id,
+      seq: row.seq,
+      role: row.role,
+      content: row.content,
+      transcriptEntryId: row.transcript_entry_id,
+      anchorTrustState: row.trust_state,
+      createdAt: row.created_at,
+    }));
+  }
+
+  /** Last `count` messages in seq order (oldest of the tail first). */
+  async getLastMessages(conversationId: ConversationId, count: number): Promise<MessageRecord[]> {
+    if (count <= 0) {
+      return [];
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
+       FROM messages
+       WHERE conversation_id = ?
+       ORDER BY seq DESC
+       LIMIT ?`,
+      )
+      .all(conversationId, Math.floor(count)) as unknown as MessageRow[];
+    return rows.reverse().map(toMessageRecord);
+  }
+
   async getLastMessage(conversationId: ConversationId): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
        FROM messages
        WHERE conversation_id = ?
        ORDER BY seq DESC
@@ -709,6 +1076,38 @@ export class ConversationStore {
       .get(conversationId) as unknown as MessageRow | undefined;
 
     return row ? toMessageRecord(row) : null;
+  }
+
+  /** Return the persisted identity hash for the newest message in a conversation. */
+  async getLastMessageIdentityHash(conversationId: ConversationId): Promise<string | null> {
+    const row = this.db
+      .prepare(
+        `SELECT identity_hash FROM messages
+       WHERE conversation_id = ?
+       ORDER BY seq DESC
+       LIMIT 1`,
+      )
+      .get(conversationId) as { identity_hash: string | null } | undefined;
+    return row?.identity_hash ?? null;
+  }
+
+  /** Return the newest `limit` persisted identity hashes in ascending seq order. */
+  async getRecentMessageIdentityHashes(
+    conversationId: ConversationId,
+    limit: number,
+  ): Promise<string[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT identity_hash FROM messages
+       WHERE conversation_id = ?
+       ORDER BY seq DESC
+       LIMIT ?`,
+      )
+      .all(conversationId, limit) as { identity_hash: string | null }[];
+    return rows
+      .map((r) => r.identity_hash)
+      .filter((h): h is string => h !== null)
+      .reverse();
   }
 
   async hasMessage(
@@ -729,6 +1128,375 @@ export class ConversationStore {
     return row?.count === 1;
   }
 
+  async hasMessageByTranscriptEntryId(
+    conversationId: ConversationId,
+    transcriptEntryId: string,
+  ): Promise<boolean> {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS count
+       FROM messages
+       WHERE conversation_id = ? AND transcript_entry_id = ?
+       LIMIT 1`,
+      )
+      .get(conversationId, transcriptEntryId) as unknown as CountRow | undefined;
+
+    return row?.count === 1;
+  }
+
+  /** Return the stored row currently claiming one transcript entry id. */
+  async getTranscriptEntryAnchorCandidate(
+    conversationId: ConversationId,
+    transcriptEntryId: string,
+  ): Promise<TranscriptEntryAnchorCandidate | null> {
+    const normalizedTranscriptEntryId = transcriptEntryId.trim();
+    if (!normalizedTranscriptEntryId) {
+      return null;
+    }
+    const row = this.db
+      .prepare(
+        `SELECT message_id, conversation_id, transcript_entry_id, role, content
+         FROM messages
+         WHERE conversation_id = ? AND transcript_entry_id = ?
+         LIMIT 1`,
+      )
+      .get(conversationId, normalizedTranscriptEntryId) as
+      | TranscriptEntryAnchorCandidateRow
+      | undefined;
+    return row ? toTranscriptEntryAnchorCandidate(row) : null;
+  }
+
+  /** Clear a false transcript id association while preserving the message row. */
+  async clearTranscriptEntryIdForMessage(
+    conversationId: ConversationId,
+    messageId: MessageId,
+  ): Promise<boolean> {
+    const result = this.db
+      .prepare(
+        `UPDATE messages
+         SET transcript_entry_id = NULL
+         WHERE conversation_id = ? AND message_id = ?`,
+      )
+      .run(conversationId, messageId);
+    return result.changes > 0;
+  }
+
+  /**
+   * Whether this conversation already holds a message with the given
+   * stable event key (responseId / toolCallId). Used by `ingestSingle`
+   * to short-circuit cross-representation duplicates.
+   */
+  async hasMessageByStableEventKey(
+    conversationId: ConversationId,
+    stableEventKey: string,
+  ): Promise<boolean> {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS count
+       FROM messages
+       WHERE conversation_id = ? AND stable_event_key = ?
+       LIMIT 1`,
+      )
+      .get(conversationId, stableEventKey) as unknown as CountRow | undefined;
+
+    return row?.count === 1;
+  }
+
+  /**
+   * Tier-1 replay-twin gate for the append-only reconcile path: does this
+   * conversation already hold a row with the same role, identity hash, and
+   * created_at SECOND as the candidate? An indexed point lookup
+   * (messages_conv_identity_hash_idx), no file read. A miss proves the candidate
+   * is genuinely new content, so the append-only fast path proceeds untouched; a
+   * hit is ambiguous (a re-append twin OR a legitimate same-second repeat) and
+   * the caller resolves it at full inner-timestamp precision.
+   */
+  async hasPersistedIdentityAtCreatedAtSecond(
+    conversationId: ConversationId,
+    role: MessageRole,
+    content: string,
+    createdAt: Date | string | undefined,
+  ): Promise<boolean> {
+    const createdAtSecond = formatMessageCreatedAt(createdAt);
+    if (!createdAtSecond) {
+      return false;
+    }
+    const identityHash = buildMessageIdentityHash(role, content);
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS count
+       FROM messages
+       WHERE conversation_id = ? AND identity_hash = ? AND role = ? AND created_at = ?
+       LIMIT 1`,
+      )
+      .get(conversationId, identityHash, role, createdAtSecond) as unknown as CountRow | undefined;
+
+    return row?.count === 1;
+  }
+
+  /**
+   * Stamp a transcript entry id onto the earliest identity-matching row that
+   * has none. Heals rows persisted from the runtime array (flush lag) or
+   * before the entry-id migration when the transcript later delivers the
+   * same message with its envelope id, instead of importing a duplicate. A
+   * matching user row also adopts allowlisted sender identity only when its
+   * sender column is still NULL, preserving any identity captured at runtime.
+   * Returns true when a row was adopted.
+   */
+  async adoptTranscriptEntryId(
+    conversationId: ConversationId,
+    role: MessageRole,
+    content: string,
+    transcriptEntryId: string,
+    openClawSenderMetadata?: OpenClawSenderMetadata | null,
+  ): Promise<boolean> {
+    const identityHash = buildMessageIdentityHash(role, content);
+    const serializedSenderMetadata =
+      role === "user" ? serializeOpenClawSenderMetadata(openClawSenderMetadata) : null;
+    const result = this.db
+      .prepare(
+        `UPDATE messages
+       SET transcript_entry_id = ?,
+           openclaw_sender_metadata = COALESCE(openclaw_sender_metadata, ?)
+       WHERE message_id = (
+         SELECT message_id
+         FROM messages
+         WHERE conversation_id = ?
+           AND transcript_entry_id IS NULL
+           AND identity_hash = ?
+           AND role = ?
+           AND content = ?
+         ORDER BY seq
+         LIMIT 1
+       )`,
+      )
+      .run(
+        transcriptEntryId,
+        serializedSenderMetadata,
+        conversationId,
+        identityHash,
+        role,
+        content,
+      );
+    return result.changes > 0;
+  }
+
+  /** Stamp a transcript entry id onto the newest identity-matching unstamped tail row. */
+  async adoptRecentTranscriptEntryId(
+    conversationId: ConversationId,
+    role: MessageRole,
+    content: string,
+    transcriptEntryId: string,
+    tailWindow: number,
+  ): Promise<boolean> {
+    const identityHash = buildMessageIdentityHash(role, content);
+    const result = this.db
+      .prepare(
+        `UPDATE messages
+         SET transcript_entry_id = ?
+         WHERE message_id = (
+           SELECT message_id
+           FROM (
+             SELECT message_id, transcript_entry_id, identity_hash, role, content
+             FROM messages
+             WHERE conversation_id = ?
+             ORDER BY seq DESC
+             LIMIT ?
+           )
+           WHERE transcript_entry_id IS NULL
+             AND identity_hash = ?
+             AND role = ?
+             AND content = ?
+           ORDER BY message_id DESC
+           LIMIT 1
+         )`,
+      )
+      .run(
+        transcriptEntryId,
+        conversationId,
+        Math.max(1, Math.floor(tailWindow)),
+        identityHash,
+        role,
+        content,
+    );
+    return result.changes > 0;
+  }
+
+  /** Stamp a transcript entry id onto one known unstamped message row. */
+  async adoptTranscriptEntryIdForMessage(
+    conversationId: ConversationId,
+    messageId: MessageId,
+    transcriptEntryId: string,
+  ): Promise<boolean> {
+    const result = this.db
+      .prepare(
+        `UPDATE messages
+         SET transcript_entry_id = ?
+         WHERE conversation_id = ?
+           AND message_id = ?
+           AND transcript_entry_id IS NULL`,
+      )
+      .run(transcriptEntryId, conversationId, messageId);
+    return result.changes > 0;
+  }
+
+  /**
+   * List identity-matching rows that already carry a transcript entry id,
+   * oldest first. The engine compares these ids against the transcript's
+   * current leaf path to find rows stranded by a host history rewrite
+   * (rewriteTranscriptEntries re-appends the suffix under new ids).
+   */
+  async listTranscriptEntryIdsByIdentity(
+    conversationId: ConversationId,
+    role: MessageRole,
+    content: string,
+  ): Promise<Array<{ messageId: number; transcriptEntryId: string }>> {
+    const identityHash = buildMessageIdentityHash(role, content);
+    const rows = this.db
+      .prepare(
+        `SELECT message_id, transcript_entry_id
+       FROM messages
+       WHERE conversation_id = ?
+         AND transcript_entry_id IS NOT NULL
+         AND identity_hash = ?
+         AND role = ?
+         AND content = ?
+       ORDER BY seq`,
+      )
+      .all(conversationId, identityHash, role, content) as unknown as Array<{
+      message_id: number;
+      transcript_entry_id: string;
+    }>;
+    return rows.map((row) => ({
+      messageId: row.message_id,
+      transcriptEntryId: row.transcript_entry_id,
+    }));
+  }
+
+  /**
+   * Return a unique recent identity-and-time matching row whose transcript id is
+   * absent from the current visible projection. This is intentionally
+   * tail-bounded and ambiguity-aware so a reissued transcript id can heal a
+   * flush-lagged row without collapsing older legitimate repeats of the same
+   * message content.
+   */
+  async findUniqueRecentStaleTranscriptEntryIdByIdentityAndCreatedAt(
+    conversationId: ConversationId,
+    role: MessageRole,
+    content: string,
+    createdAt: Date | string | undefined,
+    currentEntryIds: ReadonlySet<string>,
+    tailWindow: number,
+  ): Promise<RecentStaleTranscriptEntryMatch> {
+    const normalizedCreatedAt = formatMessageCreatedAt(createdAt);
+    if (!normalizedCreatedAt) {
+      return { status: "none" };
+    }
+    const identityHash = buildMessageIdentityHash(role, content);
+    const rows = this.db
+      .prepare(
+        `SELECT message_id, transcript_entry_id
+         FROM (
+           SELECT message_id, transcript_entry_id, identity_hash, role, content, created_at
+           FROM messages
+           WHERE conversation_id = ?
+           ORDER BY seq DESC
+           LIMIT ?
+         )
+         WHERE transcript_entry_id IS NOT NULL
+           AND identity_hash = ?
+           AND role = ?
+           AND content = ?
+           AND created_at = ?
+         ORDER BY message_id DESC`,
+      )
+      .all(
+        conversationId,
+        Math.max(1, Math.floor(tailWindow)),
+        identityHash,
+        role,
+        content,
+        normalizedCreatedAt,
+      ) as unknown as Array<{
+      message_id: number;
+      transcript_entry_id: string;
+    }>;
+
+    const candidates = rows.filter((row) => !currentEntryIds.has(row.transcript_entry_id));
+    if (candidates.length === 0) {
+      return { status: "none" };
+    }
+    if (candidates.length > 1) {
+      return { status: "ambiguous" };
+    }
+    const row = candidates[0]!;
+    return {
+      status: "found",
+      messageId: row.message_id,
+      transcriptEntryId: row.transcript_entry_id,
+    };
+  }
+
+  /**
+   * Replace a row's stale transcript entry id with the id the host re-issued
+   * for the same message. Missing user sender identity is enriched from the
+   * new envelope without overwriting existing metadata. Returns false when
+   * the new id already exists for the conversation (unique-index race:
+   * another path imported it first).
+   */
+  async restampTranscriptEntryId(
+    messageId: number,
+    transcriptEntryId: string,
+    openClawSenderMetadata?: OpenClawSenderMetadata | null,
+  ): Promise<boolean> {
+    try {
+      const serializedSenderMetadata = serializeOpenClawSenderMetadata(
+        openClawSenderMetadata,
+      );
+      const result = this.db
+        .prepare(
+          `UPDATE messages
+           SET transcript_entry_id = ?,
+               openclaw_sender_metadata = CASE
+                 WHEN role = 'user' THEN COALESCE(openclaw_sender_metadata, ?)
+                 ELSE openclaw_sender_metadata
+               END
+           WHERE message_id = ?`,
+        )
+        .run(transcriptEntryId, serializedSenderMetadata, messageId);
+      return result.changes > 0;
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("UNIQUE constraint failed")) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  /** Return the subset of `entryIds` that already exist for the conversation. */
+  async filterExistingTranscriptEntryIds(
+    conversationId: ConversationId,
+    entryIds: readonly string[],
+  ): Promise<Set<string>> {
+    const existing = new Set<string>();
+    const chunkSize = 400;
+    for (let start = 0; start < entryIds.length; start += chunkSize) {
+      const chunk = entryIds.slice(start, start + chunkSize);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(
+          `SELECT transcript_entry_id
+         FROM messages
+         WHERE conversation_id = ? AND transcript_entry_id IN (${placeholders})`,
+        )
+        .all(conversationId, ...chunk) as unknown as Array<{ transcript_entry_id: string }>;
+      for (const row of rows) {
+        existing.add(row.transcript_entry_id);
+      }
+    }
+    return existing;
+  }
+
   async countMessagesByIdentity(
     conversationId: ConversationId,
     role: MessageRole,
@@ -744,6 +1512,276 @@ export class ConversationStore {
       .get(conversationId, identityHash, role, content) as unknown as CountRow | undefined;
 
     return row?.count ?? 0;
+  }
+
+  /** Newest persisted transcript entry id (by seq), or null when none. */
+  async getNewestTranscriptEntryId(conversationId: ConversationId): Promise<string | null> {
+    const row = this.db
+      .prepare(
+        `SELECT transcript_entry_id AS id
+       FROM messages
+       WHERE conversation_id = ? AND transcript_entry_id IS NOT NULL
+       ORDER BY seq DESC
+       LIMIT 1`,
+      )
+      .get(conversationId) as unknown as { id?: string } | undefined;
+    return row?.id ?? null;
+  }
+
+  /**
+   * Persist explicit trust classification for one message transcript anchor.
+   *
+   * A non-null `messages.transcript_entry_id` is not trusted until this table
+   * marks it verified or repaired.
+   */
+  async upsertMessageTranscriptAnchorTrust(
+    input: UpsertMessageTranscriptAnchorTrustInput,
+  ): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO message_transcript_anchor_trust (
+           message_id, conversation_id, transcript_entry_id, trust_state,
+           source, reason, verified_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(message_id) DO UPDATE SET
+           conversation_id = excluded.conversation_id,
+           transcript_entry_id = excluded.transcript_entry_id,
+           trust_state = excluded.trust_state,
+           source = excluded.source,
+           reason = excluded.reason,
+           verified_at = excluded.verified_at,
+           updated_at = datetime('now')`,
+      )
+      .run(
+        input.messageId,
+        input.conversationId,
+        input.transcriptEntryId ?? null,
+        input.trustState,
+        input.source,
+        input.reason ?? null,
+        formatNullableTimestamp(input.verifiedAt),
+      );
+  }
+
+  /** Return the explicit transcript-anchor trust row for one message. */
+  async getMessageTranscriptAnchorTrust(
+    messageId: MessageId,
+  ): Promise<MessageTranscriptAnchorTrustRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT
+           message_id,
+           conversation_id,
+           transcript_entry_id,
+           trust_state,
+           source,
+           reason,
+           verified_at,
+           created_at,
+           updated_at
+         FROM message_transcript_anchor_trust
+         WHERE message_id = ?`,
+      )
+      .get(messageId) as MessageTranscriptAnchorTrustRow | undefined;
+    return row ? toMessageTranscriptAnchorTrustRecord(row) : null;
+  }
+
+  /** True only for verified or repaired anchors in this conversation. */
+  async isTrustedTranscriptAnchor(
+    conversationId: ConversationId,
+    transcriptEntryId: string,
+  ): Promise<boolean> {
+    const normalizedTranscriptEntryId = transcriptEntryId.trim();
+    if (!normalizedTranscriptEntryId) {
+      return false;
+    }
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS found
+         FROM message_transcript_anchor_trust
+         WHERE conversation_id = ?
+           AND transcript_entry_id = ?
+           AND trust_state IN ('verified', 'repaired')
+         LIMIT 1`,
+      )
+      .get(conversationId, normalizedTranscriptEntryId) as { found?: number } | undefined;
+    return row?.found === 1;
+  }
+
+  /** Persist the transcript epoch frontier for one Lossless conversation. */
+  async upsertConversationTranscriptEpoch(
+    input: UpsertConversationTranscriptEpochInput,
+  ): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO conversation_transcript_epochs (
+           conversation_id,
+           session_id,
+           session_key,
+           frontier_entry_id,
+           frontier_seq,
+           frontier_created_at,
+           migration_mode,
+           metadata_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(conversation_id) DO UPDATE SET
+           session_id = excluded.session_id,
+           session_key = excluded.session_key,
+           frontier_entry_id = excluded.frontier_entry_id,
+           frontier_seq = excluded.frontier_seq,
+           frontier_created_at = excluded.frontier_created_at,
+           migration_mode = excluded.migration_mode,
+           metadata_json = excluded.metadata_json,
+           updated_at = datetime('now')`,
+      )
+      .run(
+        input.conversationId,
+        input.sessionId,
+        input.sessionKey ?? null,
+        input.frontierEntryId ?? null,
+        input.frontierSeq ?? null,
+        formatNullableTimestamp(input.frontierCreatedAt),
+        input.migrationMode,
+        input.metadata === undefined ? null : JSON.stringify(input.metadata),
+      );
+  }
+
+  /** Return the recorded transcript epoch frontier for one conversation. */
+  async getConversationTranscriptEpoch(
+    conversationId: ConversationId,
+  ): Promise<ConversationTranscriptEpochRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT
+           conversation_id,
+           session_id,
+           session_key,
+           frontier_entry_id,
+           frontier_seq,
+           frontier_created_at,
+           migration_mode,
+           metadata_json,
+           created_at,
+           updated_at
+         FROM conversation_transcript_epochs
+         WHERE conversation_id = ?`,
+      )
+      .get(conversationId) as ConversationTranscriptEpochRow | undefined;
+    return row ? toConversationTranscriptEpochRecord(row) : null;
+  }
+
+  /**
+   * Whether an identity-matching row WITHIN THE TAIL WINDOW exists that has
+   * NOT been stamped with a transcript entry id — i.e. a flush-lagged
+   * runtime row (persisted moments ago, always tail-adjacent) that a
+   * transcript catch-up entry should adopt instead of importing a
+   * duplicate. Legacy pre-migration rows deeper in history also lack entry
+   * ids but are NOT flush lag; matching them would defer every repeated
+   * content and mis-target adoption.
+   */
+  async hasRecentUnstampedMessageByIdentity(
+    conversationId: ConversationId,
+    role: MessageRole,
+    content: string,
+    tailWindow: number,
+  ): Promise<boolean> {
+    const identityHash = buildMessageIdentityHash(role, content);
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS found
+       FROM (
+         SELECT message_id, transcript_entry_id, identity_hash, role, content
+         FROM messages
+         WHERE conversation_id = ?
+         ORDER BY seq DESC
+         LIMIT ?
+       )
+       WHERE transcript_entry_id IS NULL
+         AND identity_hash = ?
+         AND role = ?
+         AND content = ?
+       LIMIT 1`,
+      )
+      .get(conversationId, Math.max(1, Math.floor(tailWindow)), identityHash, role, content) as unknown as
+      | { found?: number }
+      | undefined;
+    return row?.found === 1;
+  }
+
+  /**
+   * Return recent unstamped rows of one role for projection reconciliation.
+   *
+   * The caller performs the decoration-aware comparison before stamping an
+   * entry id, so this query deliberately preserves the stored content.
+   */
+  async listRecentUnstampedMessagesByRole(
+    conversationId: ConversationId,
+    role: MessageRole,
+    tailWindow: number,
+  ): Promise<Array<{ messageId: MessageId; content: string }>> {
+    const rows = this.db
+      .prepare(
+        `SELECT message_id, content
+         FROM (
+           SELECT message_id, content, transcript_entry_id, role, seq
+           FROM messages
+           WHERE conversation_id = ?
+           ORDER BY seq DESC
+           LIMIT ?
+         )
+         WHERE transcript_entry_id IS NULL AND role = ?
+         ORDER BY seq ASC`,
+      )
+      .all(conversationId, Math.max(1, Math.floor(tailWindow)), role) as unknown as Array<{
+      message_id: number;
+      content: string;
+    }>;
+    return rows.map((row) => ({ messageId: row.message_id, content: row.content }));
+  }
+
+  /**
+   * Whether the newest persisted row has the same identity hash and preserved
+   * reasoning content. Used to dedup adjacent delivery-mirror messages whose
+   * text content is already covered by the immediately preceding response entry.
+   */
+  async hasPreviousReasonedMessageByIdentity(
+    conversationId: ConversationId,
+    role: MessageRole,
+    content: string,
+  ): Promise<boolean> {
+    const identityHash = buildMessageIdentityHash(role, content);
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS found
+       FROM (
+         SELECT message_id, identity_hash, role, content
+         FROM messages
+         WHERE conversation_id = ?
+         ORDER BY seq DESC
+         LIMIT 1
+       ) AS newest
+       WHERE newest.identity_hash = ?
+         AND newest.role = ?
+         AND newest.content = ?
+         AND EXISTS (
+           SELECT 1
+           FROM message_parts AS part
+           WHERE part.message_id = newest.message_id
+             AND (
+               part.part_type = 'reasoning'
+               OR (
+                 part.metadata IS NOT NULL
+                 AND json_valid(part.metadata)
+                 AND json_extract(part.metadata, '$.topLevelReasoningField') = 'reasoning_content'
+                 AND json_type(part.metadata, '$.topLevelReasoningContent') = 'text'
+                 AND length(json_extract(part.metadata, '$.topLevelReasoningContent')) > 0
+               )
+             )
+         )
+       LIMIT 1`,
+      )
+      .get(conversationId, identityHash, role, content) as unknown as { found?: number } | undefined;
+    return row?.found === 1;
   }
 
   async countMessagesByIdentityHash(
@@ -802,7 +1840,7 @@ export class ConversationStore {
   async getMessageById(messageId: MessageId): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
        FROM messages WHERE message_id = ?`,
       )
       .get(messageId) as unknown as MessageRow | undefined;
@@ -813,7 +1851,7 @@ export class ConversationStore {
   async getMessageByLargeContent(fileId: string): Promise<MessageRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
        FROM messages
        WHERE large_content = ?
        ORDER BY seq DESC
@@ -907,8 +1945,8 @@ export class ConversationStore {
   /**
    * Delete messages and their associated records (context_items, FTS, message_parts).
    *
-   * Skips messages referenced in summary_messages (already compacted) to avoid
-   * breaking the summary DAG. Returns the count of actually deleted messages.
+   * Skips messages referenced by canonical or pending summaries to avoid
+   * breaking summary DAGs. Returns the count of actually deleted messages.
    */
   async deleteMessages(messageIds: MessageId[]): Promise<number> {
     if (messageIds.length === 0) {
@@ -919,8 +1957,12 @@ export class ConversationStore {
     for (const messageId of messageIds) {
       // Skip if referenced by a summary (ON DELETE RESTRICT would fail anyway)
       const refRow = this.db
-        .prepare(`SELECT 1 AS found FROM summary_messages WHERE message_id = ? LIMIT 1`)
-        .get(messageId) as unknown as { found: number } | undefined;
+        .prepare(
+          `SELECT 1 AS found
+           WHERE EXISTS (SELECT 1 FROM summary_messages WHERE message_id = ?)
+              OR EXISTS (SELECT 1 FROM pending_summary_node_messages WHERE message_id = ?)`,
+        )
+        .get(messageId, messageId) as unknown as { found: number } | undefined;
       if (refRow) {
         continue;
       }
@@ -1030,8 +2072,10 @@ export class ConversationStore {
   ): PreparedMessageInsert {
     return {
       ...input,
-      createdAt,
+      createdAt: formatMessageCreatedAt(input.createdAt) ?? createdAt,
       identityHash: input.identityHash ?? buildMessageIdentityHash(input.role, input.content),
+      openClawSenderMetadata: input.role === "user" ? input.openClawSenderMetadata : null,
+      stableEventKey: input.stableEventKey ?? null,
     };
   }
 
@@ -1299,7 +2343,7 @@ export class ConversationStore {
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
          FROM messages
          ${whereClause}
          ORDER BY created_at DESC
@@ -1336,14 +2380,8 @@ export class ConversationStore {
     before?: Date,
   ): MessageSearchResult[] {
     // SQLite has no native POSIX regex; fetch candidates and filter in JS
-    // Guard against ReDoS: reject patterns with nested quantifiers or excessive length
-    if (pattern.length > 500 || /(\+|\*|\?)\)(\+|\*|\?|\{\d)/.test(pattern)) {
-      return [];
-    }
-    let re: RegExp;
-    try {
-      re = new RegExp(pattern);
-    } catch {
+    const re = compileSafeSearchRegex(pattern);
+    if (!re) {
       return [];
     }
 
@@ -1367,7 +2405,7 @@ export class ConversationStore {
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content
+        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at, large_content, transcript_entry_id, openclaw_sender_metadata
          FROM messages
          ${whereClause}
          ORDER BY created_at DESC`,

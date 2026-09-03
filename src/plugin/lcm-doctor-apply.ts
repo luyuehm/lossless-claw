@@ -1,10 +1,11 @@
 import type { DatabaseSync } from "node:sqlite";
-import { withDatabaseTransaction } from "../transaction-mutex.js";
+import { DatabaseTransactionTimeoutError, withExclusiveDatabaseLock } from "../transaction-mutex.js";
 import { formatTimestamp } from "../compaction.js";
 import type { LcmConfig } from "../db/config.js";
 import type { LcmSummarizeFn } from "../summarize.js";
 import { createLcmSummarizeFromLegacyParams } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
+import { createLcmDatabaseBackup } from "./lcm-db-backup.js";
 import { detectDoctorMarker, loadDoctorTargets, type DoctorTargetRecord } from "./lcm-doctor-shared.js";
 import { estimateTokens } from "../estimate-tokens.js";
 
@@ -31,6 +32,7 @@ export type DoctorApplyResult =
       unchanged: number;
       skipped: DoctorApplySkip[];
       repairedSummaryIds: string[];
+      backupPath?: string;
     }
   | {
       kind: "unavailable";
@@ -42,6 +44,8 @@ type DoctorApplyRow = {
   ordinal: number;
   content?: string;
 };
+
+const DOCTOR_APPLY_DATABASE_LOCK_TIMEOUT_MS = 30_000;
 
 /**
  * Repair broken summaries for a single resolved conversation.
@@ -80,6 +84,7 @@ export async function applyScopedDoctorRepair(params: {
   const overrides = new Map<string, SummaryOverride>();
   const skipped: DoctorApplySkip[] = [];
   const repairedSummaryIds: string[] = [];
+  let backupPath: string | undefined;
   let unchanged = 0;
 
   for (const target of ordered) {
@@ -143,22 +148,68 @@ export async function applyScopedDoctorRepair(params: {
   }
 
   if (repairedSummaryIds.length > 0) {
-    await withDatabaseTransaction(params.db, "BEGIN IMMEDIATE", async () => {
-        for (const summaryId of repairedSummaryIds) {
-          const override = overrides.get(summaryId);
-          if (!override) {
-            continue;
+    try {
+      const unavailable = await withExclusiveDatabaseLock(
+        params.db,
+        { timeoutMs: DOCTOR_APPLY_DATABASE_LOCK_TIMEOUT_MS },
+        () => {
+          if (params.db.isTransaction) {
+            return {
+              kind: "unavailable" as const,
+              reason:
+                "Lossless Claw obtained exclusive doctor apply access, but the shared database connection is still inside another transaction.",
+            };
           }
-          params.db
-            .prepare(
-              `UPDATE summaries
-               SET content = ?, token_count = ?
-               WHERE summary_id = ?`,
-            )
-            .run(override.content, override.tokenCount, summaryId);
-          updateSummaryFts(params.db, summaryId, override.content);
-        }
-    });
+
+          const createdBackupPath = createLcmDatabaseBackup(params.db, {
+            databasePath: params.config.databasePath,
+            label: "scoped-doctor-repair",
+          });
+          if (!createdBackupPath) {
+            return {
+              kind: "unavailable" as const,
+              reason: "Lossless Claw could not determine a doctor apply backup path.",
+            };
+          }
+          backupPath = createdBackupPath;
+
+          params.db.exec("BEGIN IMMEDIATE");
+          try {
+            for (const summaryId of repairedSummaryIds) {
+              const override = overrides.get(summaryId);
+              if (!override) {
+                continue;
+              }
+              params.db
+                .prepare(
+                  `UPDATE summaries
+                   SET content = ?, token_count = ?
+                   WHERE summary_id = ?`,
+                )
+                .run(override.content, override.tokenCount, summaryId);
+              updateSummaryFts(params.db, summaryId, override.content);
+            }
+            params.db.exec("COMMIT");
+          } catch (error) {
+            params.db.exec("ROLLBACK");
+            throw error;
+          }
+
+          return null;
+        },
+      );
+      if (unavailable) {
+        return unavailable;
+      }
+    } catch (error) {
+      if (error instanceof DatabaseTransactionTimeoutError) {
+        return {
+          kind: "unavailable",
+          reason: `Lossless Claw waited ${Math.floor(DOCTOR_APPLY_DATABASE_LOCK_TIMEOUT_MS / 1000)}s for the database to become idle, but another transaction never finished.`,
+        };
+      }
+      throw error;
+    }
   }
 
   return {
@@ -168,6 +219,7 @@ export async function applyScopedDoctorRepair(params: {
     unchanged,
     skipped,
     repairedSummaryIds,
+    ...(backupPath ? { backupPath } : {}),
   };
 }
 
@@ -283,19 +335,26 @@ function buildLeafSourceText(params: {
 }): string {
   const rows = params.db
     .prepare(
-      `SELECT m.created_at, COALESCE(m.content, '') AS content
+      `SELECT m.created_at, m.role, COALESCE(m.content, '') AS content
        FROM summary_messages sm
        JOIN messages m ON m.message_id = sm.message_id
        WHERE sm.summary_id = ?
        ORDER BY sm.ordinal ASC`,
     )
-    .all(params.target.summaryId) as Array<{ created_at: string; content: string }>;
+    .all(params.target.summaryId) as Array<{
+      created_at: string;
+      role: string | null;
+      content: string;
+    }>;
   if (rows.length === 0) {
     throw new Error("no messages linked to summary");
   }
 
   return rows
-    .map((row) => `[${formatSqliteTimestamp(row.created_at, params.timezone)}]\n${row.content}`)
+    .map(
+      (row) =>
+        `[${formatSqliteTimestamp(row.created_at, params.timezone)} | ${row.role ?? "unknown"}]\n${row.content}`,
+    )
     .join("\n\n");
 }
 

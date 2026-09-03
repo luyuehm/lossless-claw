@@ -1,23 +1,28 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { getLcmDbFeatures } from "../src/db/features.js";
+import { formatTimestamp } from "../src/compaction.js";
 import { createLcmDatabaseConnection, closeLcmConnection } from "../src/db/connection.js";
 import { resolveLcmConfig } from "../src/db/config.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
 import { FocusBriefStore } from "../src/store/focus-brief-store.js";
 import { SummaryStore } from "../src/store/summary-store.js";
+import { CompactionMaintenanceStore } from "../src/store/compaction-maintenance-store.js";
 import { createLcmCommand, __testing } from "../src/plugin/lcm-command.js";
 import { FALLBACK_DIRECTIVE_SUMMARY_MARKER } from "../src/summary-fallback.js";
 import type { LcmSummarizeFn } from "../src/summarize.js";
 import type { LcmDependencies } from "../src/types.js";
+import packageJson from "../package.json" with { type: "json" };
 
 function createCommandFixture(options?: {
   summarize?: LcmSummarizeFn;
   deps?: LcmDependencies;
   getLcm?: () => Promise<any>;
+  openClawConfig?: unknown;
 }) {
   const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-command-"));
   const dbPath = join(tempDir, "lcm.db");
@@ -30,6 +35,7 @@ function createCommandFixture(options?: {
   const command = createLcmCommand({
     db,
     config,
+    openClawConfig: options?.openClawConfig,
     summarize: options?.summarize,
     deps: options?.deps,
     getLcm: options?.getLcm,
@@ -65,12 +71,168 @@ function createCommandContext(
   };
 }
 
+type CommandFixture = ReturnType<typeof createCommandFixture>;
+
+function writeOpenClawInstallRecord(params: {
+  stateDir: string;
+  pluginId: string;
+  record: Record<string, unknown>;
+}): void {
+  const stateDbDir = join(params.stateDir, "state");
+  mkdirSync(stateDbDir, { recursive: true });
+  const db = new DatabaseSync(join(stateDbDir, "openclaw.sqlite"));
+  try {
+    db.exec(`
+      CREATE TABLE installed_plugin_index (
+        index_key TEXT PRIMARY KEY,
+        install_records_json TEXT NOT NULL,
+        plugins_json TEXT NOT NULL
+      )
+    `);
+    db.prepare(
+      `INSERT INTO installed_plugin_index (
+         index_key,
+         install_records_json,
+         plugins_json
+       ) VALUES (?, ?, ?)`,
+    ).run(
+      "installed-plugin-index",
+      JSON.stringify({ [params.pluginId]: params.record }),
+      "[]",
+    );
+  } finally {
+    db.close();
+  }
+}
+
+async function createRolloverConversationData(
+  fixture: CommandFixture,
+  input: {
+    conversationId: number;
+    label: string;
+    transcriptEntryId?: string;
+    includeSummary?: boolean;
+    includeLargeFile?: boolean;
+    includeFocusBrief?: boolean;
+  },
+): Promise<void> {
+  const [message] = await fixture.conversationStore.createMessagesBulk([
+    {
+      conversationId: input.conversationId,
+      seq: 0,
+      role: "user",
+      content: `${input.label} message`,
+      tokenCount: 5,
+      ...(input.transcriptEntryId ? { transcriptEntryId: input.transcriptEntryId } : {}),
+    },
+  ]);
+  await fixture.summaryStore.appendContextMessage(input.conversationId, message.messageId);
+
+  if (input.includeSummary) {
+    const summaryId = `${input.label}_summary`;
+    await fixture.summaryStore.insertSummary({
+      summaryId,
+      conversationId: input.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: `${input.label} summary`,
+      tokenCount: 3,
+      sourceMessageTokenCount: 5,
+    });
+    await fixture.summaryStore.linkSummaryToMessages(summaryId, [message.messageId]);
+    await fixture.summaryStore.appendContextSummary(input.conversationId, summaryId);
+  }
+
+  if (input.includeLargeFile) {
+    await fixture.summaryStore.insertLargeFile({
+      fileId: `${input.label}_file`,
+      conversationId: input.conversationId,
+      fileName: `${input.label}.txt`,
+      mimeType: "text/plain",
+      byteSize: 64,
+      storageUri: `file:///tmp/${input.label}.txt`,
+      explorationSummary: `${input.label} file summary`,
+    });
+  }
+
+  if (input.includeFocusBrief) {
+    fixture.db
+      .prepare(
+        `INSERT INTO focus_briefs (
+           brief_id,
+           conversation_id,
+           session_key,
+           prompt,
+           content,
+           status
+         ) VALUES (?, ?, ?, ?, ?, 'active')`,
+      )
+      .run(
+        `${input.label}_brief`,
+        input.conversationId,
+        `agent:main:test:${input.label}`,
+        `${input.label} focus prompt`,
+        `${input.label} focus content`,
+      );
+  }
+}
+
+function setConversationTimes(
+  fixture: CommandFixture,
+  conversationId: number,
+  createdAt: string,
+  archivedAt?: string,
+): void {
+  fixture.db
+    .prepare(
+      `UPDATE conversations
+       SET created_at = ?,
+           archived_at = COALESCE(?, archived_at),
+           updated_at = ?
+       WHERE conversation_id = ?`,
+    )
+    .run(createdAt, archivedAt ?? null, archivedAt ?? createdAt, conversationId);
+}
+
+function insertRolloverStateRows(fixture: CommandFixture, sourceId: number, targetId: number): void {
+  fixture.db
+    .prepare(
+      `INSERT INTO conversation_compaction_telemetry (
+         conversation_id,
+         cache_state
+       ) VALUES (?, 'cold')`,
+    )
+    .run(sourceId);
+  fixture.db
+    .prepare(
+      `INSERT INTO conversation_compaction_maintenance (
+         conversation_id,
+         pending,
+         reason
+       ) VALUES (?, 1, 'old-source-maintenance')`,
+    )
+    .run(sourceId);
+  fixture.db
+    .prepare(
+      `INSERT INTO conversation_compaction_maintenance (
+         conversation_id,
+         pending,
+         reason,
+         resolution_reason,
+         resolved_at,
+         maintenance_revision
+       ) VALUES (?, 0, 'target-maintenance', 'operator-ignored', '2026-06-17T00:00:00.000Z', 7)`,
+    )
+    .run(targetId);
+}
+
 describe("lcm command", () => {
   const tempDirs = new Set<string>();
   const dbPaths = new Set<string>();
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     for (const dbPath of dbPaths) {
       closeLcmConnection(dbPath);
     }
@@ -150,6 +312,324 @@ describe("lcm command", () => {
     expect(result.text).toContain("OpenClaw did not expose an active session key or session id here");
   });
 
+  it("warns when status sees an exact npm install spec for the selected LCM engine", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const result = await fixture.command.handler(
+      createCommandContext(undefined, {
+        config: {
+          plugins: {
+            entries: {
+              "lossless-claw": {
+                enabled: true,
+              },
+            },
+            slots: {
+              contextEngine: "lossless-claw",
+            },
+            installs: {
+              "lossless-claw": {
+                source: "npm",
+                spec: "@martian-engineering/lossless-claw@0.12.0",
+                version: "0.12.0",
+              },
+            },
+          },
+        },
+      }),
+    );
+
+    expect(result.text).toContain("**⚠️ Update track**");
+    expect(result.text).toContain("status: exact-pinned");
+    expect(result.text).toContain("installed spec: `@martian-engineering/lossless-claw@0.12.0`");
+    expect(result.text).toContain("impact: OpenClaw plugin update sync will keep this exact version");
+    expect(result.text).toContain("repair: `openclaw plugins update @martian-engineering/lossless-claw@latest`");
+  });
+
+  it("warns when status sees an exact npm install spec in OpenClaw's installed plugin index", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const stateDir = join(fixture.tempDir, "openclaw-state");
+    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+    writeOpenClawInstallRecord({
+      stateDir,
+      pluginId: "lossless-claw",
+      record: {
+        source: "npm",
+        spec: "@martian-engineering/lossless-claw@0.12.0",
+        version: "0.12.0",
+      },
+    });
+
+    const result = await fixture.command.handler(createCommandContext());
+
+    expect(result.text).toContain("**⚠️ Update track**");
+    expect(result.text).toContain("installed spec: `@martian-engineering/lossless-claw@0.12.0`");
+  });
+
+  it("warns when status sees the prerelease npm channel on the stable 1.0 line", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const result = await fixture.command.handler(
+      createCommandContext(undefined, {
+        config: {
+          plugins: {
+            entries: {
+              "lossless-claw": {
+                enabled: true,
+              },
+            },
+            slots: {
+              contextEngine: "lossless-claw",
+            },
+            installs: {
+              "lossless-claw": {
+                source: "npm",
+                spec: "@martian-engineering/lossless-claw@beta",
+                version: "1.0.0-beta.7",
+              },
+            },
+          },
+        },
+      }),
+    );
+
+    expect(result.text).toContain("**⚠️ Update track**");
+    expect(result.text).toContain("status: wrong-channel");
+    expect(result.text).toContain("installed spec: `@martian-engineering/lossless-claw@beta`");
+    expect(result.text).toContain("impact: OpenClaw plugin update sync will follow Lossless Claw prereleases");
+    expect(result.text).toContain("repair: `openclaw plugins update @martian-engineering/lossless-claw@latest`");
+  });
+
+  it("does not warn when status sees the moving stable npm install spec", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const result = await fixture.command.handler(
+      createCommandContext(undefined, {
+        config: {
+          plugins: {
+            entries: {
+              "lossless-claw": {
+                enabled: true,
+              },
+            },
+            slots: {
+              contextEngine: "lossless-claw",
+            },
+            installs: {
+              "lossless-claw": {
+                source: "npm",
+                spec: "@martian-engineering/lossless-claw@latest",
+                version: "1.0.0",
+              },
+            },
+          },
+        },
+      }),
+    );
+
+    expect(result.text).not.toContain("**⚠️ Update track**");
+    expect(result.text).not.toContain("status: exact-pinned");
+  });
+
+  it("warns from doctor when the fallback OpenClaw config has an exact npm install spec", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const command = createLcmCommand({
+      db: fixture.db,
+      config: fixture.config,
+      openClawConfig: {
+        plugins: {
+          entries: {
+            "lossless-claw": {
+              enabled: true,
+            },
+          },
+          slots: {
+            contextEngine: "lossless-claw",
+          },
+          installs: {
+            "lossless-claw": {
+              source: "npm",
+              spec: "@martian-engineering/lossless-claw@0.12.0",
+              version: "0.12.0",
+            },
+          },
+        },
+      },
+    });
+
+    const result = await command.handler(
+      createCommandContext("doctor", {
+        config: {
+          plugins: {
+            entries: {
+              "lossless-claw": {
+                enabled: true,
+              },
+            },
+            slots: {
+              contextEngine: "lossless-claw",
+            },
+          },
+        },
+      }),
+    );
+
+    expect(result.text).toContain("🩺 Lossless Claw Doctor");
+    expect(result.text).toContain("**⚠️ Update track**");
+    expect(result.text).toContain("installed spec: `@martian-engineering/lossless-claw@0.12.0`");
+  });
+
+  it("warns when doctor finds a generated project copy newer than the active copy", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const stateDir = join(fixture.tempDir, "openclaw-state");
+    const activePath = join(stateDir, "active-loaded-copy");
+    const liveShadowPath = join(
+      stateDir,
+      "node_modules",
+      "@martian-engineering",
+      "lossless-claw",
+    );
+    const generatedPath = join(
+      stateDir,
+      "npm",
+      "projects",
+      "generated-project",
+      "node_modules",
+      "@martian-engineering",
+      "lossless-claw",
+    );
+    const extensionShadowPath = join(
+      stateDir,
+      "extensions",
+      "node_modules",
+      "@martian-engineering",
+      "lossless-claw",
+    );
+    mkdirSync(activePath, { recursive: true });
+    mkdirSync(liveShadowPath, { recursive: true });
+    mkdirSync(extensionShadowPath, { recursive: true });
+    mkdirSync(generatedPath, { recursive: true });
+    writeFileSync(
+      join(activePath, "package.json"),
+      JSON.stringify({ name: "@martian-engineering/lossless-claw", version: packageJson.version }),
+    );
+    writeFileSync(
+      join(liveShadowPath, "package.json"),
+      JSON.stringify({ name: "@martian-engineering/lossless-claw", version: packageJson.version }),
+    );
+    writeFileSync(
+      join(extensionShadowPath, "package.json"),
+      JSON.stringify({ name: "@martian-engineering/lossless-claw", version: packageJson.version }),
+    );
+    writeFileSync(
+      join(generatedPath, "package.json"),
+      JSON.stringify({ name: "@martian-engineering/lossless-claw", version: "999.0.0" }),
+    );
+    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+    const command = createLcmCommand({
+      db: fixture.db,
+      config: fixture.config,
+      activeSourcePath: activePath,
+    });
+
+    const result = await command.handler(createCommandContext("doctor"));
+
+    expect(result.text).toContain("**⚠️ Version split**");
+    expect(result.text).toContain(`active version: ${packageJson.version}`);
+    expect(result.text).toContain(`active path: \`${activePath}\``);
+    expect(result.text).toContain(
+      `shadow copy (live): \`${liveShadowPath}\` (v${packageJson.version})`,
+    );
+    expect(result.text).toContain(
+      `shadow copy (live): \`${extensionShadowPath}\` (v${packageJson.version})`,
+    );
+    expect(result.text).toContain(`shadow copy (generated): \`${generatedPath}\` (v999.0.0)`);
+    expect(result.text).toContain("generated or live copy differs from the active Lossless Claw copy");
+  });
+
+  it("reports clean version diagnostics when doctor finds no shadow copies", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const stateDir = join(fixture.tempDir, "openclaw-state");
+    const activePath = join(
+      stateDir,
+      "extensions",
+      "node_modules",
+      "@martian-engineering",
+      "lossless-claw",
+    );
+    const activeSourcePath = join(activePath, "dist", "index.js");
+    mkdirSync(join(activePath, "dist"), { recursive: true });
+    writeFileSync(
+      join(activePath, "package.json"),
+      JSON.stringify({ name: "@martian-engineering/lossless-claw", version: packageJson.version }),
+    );
+    writeFileSync(activeSourcePath, "export default {};\n");
+    vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+    const command = createLcmCommand({
+      db: fixture.db,
+      config: fixture.config,
+      activeSourcePath,
+    });
+
+    const result = await command.handler(createCommandContext("doctor"));
+
+    expect(result.text).toContain("**🧩 Installed copies**");
+    expect(result.text).toContain(`active version: ${packageJson.version}`);
+    expect(result.text).toContain(`active path: \`${activePath}\``);
+    expect(result.text).toContain("shadow copies: none found");
+    expect(result.text).not.toContain("**⚠️ Version split**");
+  });
+
+  it("surfaces rollover split memory from the default status command", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const sessionKey = "agent:main:test:status-rollover-detect";
+    const archived = await fixture.conversationStore.createConversation({
+      sessionId: "status-rollover-old",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: archived.conversationId,
+      label: "statusold",
+      includeSummary: true,
+    });
+    await fixture.conversationStore.archiveConversation(archived.conversationId, "rollover-fallback");
+
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "status-rollover-new",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: active.conversationId,
+      label: "statusactive",
+    });
+    setConversationTimes(fixture, archived.conversationId, "2026-06-17 03:00:00", "2026-06-17 03:05:00");
+    setConversationTimes(fixture, active.conversationId, "2026-06-17 03:10:00");
+
+    const result = await fixture.command.handler(createCommandContext());
+
+    expect(result.text).toContain("**⚠️ Rollover split memory**");
+    expect(result.text).toContain("result: safe repairs available");
+    expect(result.text).toContain("affected safe lanes: 1");
+    expect(result.text).toContain("repair: `/lossless doctor apply rollover-splits confirm`");
+  });
+
   it("resolves current conversation stats when the host provides a session key", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
@@ -223,7 +703,7 @@ describe("lcm command", () => {
     expect(result.text).toContain("summaries: 2 (1 leaf, 1 condensed)");
     expect(result.text).toContain("stored summary tokens: 12");
     expect(result.text).toContain("summarized source tokens: 21");
-    expect(result.text).toContain("tokens in context: 5");
+    expect(result.text).toContain("LCM frontier tokens: 5");
     expect(result.text).toContain("compression ratio: 1:6");
     expect(result.text).toContain("lcm health: healthy");
     expect(result.text).toContain("transport health: not assessed by Lossless Claw");
@@ -399,8 +879,6 @@ describe("lcm command", () => {
         return typeof latest?.content === "string" ? latest.content : undefined;
       },
       resolveAgentDir: () => fixture.tempDir,
-      resolveSessionIdFromSessionKey: async () => undefined,
-      resolveSessionTranscriptFile: async () => undefined,
       agentLaneSubagent: "subagent",
       log: {
         info: vi.fn(),
@@ -419,7 +897,6 @@ describe("lcm command", () => {
       deps,
       getLcm: async () => ({
         compact,
-        rotateSessionStorageWithBackup: vi.fn(),
       }),
     });
 
@@ -698,8 +1175,6 @@ describe("lcm command", () => {
         return typeof latest?.content === "string" ? latest.content : undefined;
       },
       resolveAgentDir: () => fixture.tempDir,
-      resolveSessionIdFromSessionKey: async () => undefined,
-      resolveSessionTranscriptFile: async () => undefined,
       agentLaneSubagent: "subagent",
       log: {
         info: vi.fn(),
@@ -718,7 +1193,6 @@ describe("lcm command", () => {
       deps,
       getLcm: async () => ({
         compact,
-        rotateSessionStorageWithBackup: vi.fn(),
       }),
     });
 
@@ -814,8 +1288,6 @@ describe("lcm command", () => {
       buildSubagentSystemPrompt: () => "subagent system prompt",
       readLatestAssistantReply: () => undefined,
       resolveAgentDir: () => fixture.tempDir,
-      resolveSessionIdFromSessionKey: async () => undefined,
-      resolveSessionTranscriptFile: async () => undefined,
       agentLaneSubagent: "subagent",
       log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     } as unknown as LcmDependencies;
@@ -825,7 +1297,6 @@ describe("lcm command", () => {
       deps,
       getLcm: async () => ({
         compact: vi.fn(async () => ({ ok: true, compacted: true, reason: "forced full sweep" })),
-        rotateSessionStorageWithBackup: vi.fn(),
       }),
     });
 
@@ -893,8 +1364,12 @@ describe("lcm command", () => {
     expect(result.text).toContain("state: pending");
     expect(result.text).toContain("reason: budget-trigger");
     expect(result.text).toContain("last failure: provider timeout");
-    expect(result.text).toContain("requested token budget: 128,000");
-    expect(result.text).toContain("observed token count: 96,000");
+    expect(result.text).toContain("budget: 128,000");
+    expect(result.text).not.toContain("observed token count: 96,000");
+    expect(result.text).not.toContain("projected token count");
+    expect(result.text).not.toContain("raw tokens outside tail");
+    expect(result.text).not.toContain("cache state");
+    expect(result.text).not.toContain("provider/model");
   });
 
   it("reports LCM token pressure separately from transport health in status output", async () => {
@@ -948,7 +1423,79 @@ describe("lcm command", () => {
     );
   });
 
-  it("warns when repair-source pressure would block doctor apply even if active context is small", async () => {
+  it("uses the last runtime maintenance budget for status health when no cap is configured", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "status-runtime-budget-session",
+      sessionKey: "agent:main:telegram:runtime-budget:1",
+      title: "Runtime budget fixture",
+    });
+    const [message] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "frontier above fallback but below runtime threshold",
+        tokenCount: 144_291,
+      },
+    ]);
+    await fixture.summaryStore.appendContextMessages(conversation.conversationId, [message.messageId]);
+    fixture.db
+      .prepare(
+        `INSERT INTO conversation_compaction_maintenance (
+           conversation_id,
+           pending,
+           requested_at,
+           reason,
+           running,
+           last_started_at,
+           last_finished_at,
+           token_budget,
+           current_token_count,
+           projected_token_count,
+           updated_at
+         ) VALUES (?, 0, ?, ?, 0, ?, ?, ?, ?, ?, datetime('now'))`,
+      )
+      .run(
+        conversation.conversationId,
+        "2026-06-17T18:22:15.729Z",
+        "threshold",
+        "2026-06-17T18:52:47.111Z",
+        "2026-06-17T18:52:47.113Z",
+        258_000,
+        75_448,
+        228_874,
+      );
+
+    const result = await fixture.command.handler(
+      createCommandContext(undefined, {
+        sessionKey: "agent:main:telegram:runtime-budget:1",
+        sessionId: "status-runtime-budget-session",
+      }),
+    );
+
+    expect(result.text).toContain("LCM frontier tokens: 144,291");
+    expect(result.text).toContain("budget: 258,000");
+    expect(result.text).toContain(
+      `last finished: ${formatTimestamp(new Date("2026-06-17T18:52:47.113Z"), fixture.config.timezone)}`,
+    );
+    expect(result.text).toContain("lcm health: healthy");
+    expect(result.text).not.toContain("assembly budget 128,000");
+    expect(result.text).not.toContain("lcm reason: observed token count 144,291");
+    expect(result.text).not.toContain("requested at");
+    expect(result.text).not.toContain("reason: threshold");
+    expect(result.text).not.toContain("observed token count");
+    expect(result.text).not.toContain("projected token count");
+    expect(result.text).not.toContain("raw tokens outside tail");
+    expect(result.text).not.toContain("last api call");
+    expect(result.text).not.toContain("cache state");
+    expect(result.text).not.toContain("provider/model");
+  });
+
+  it("does not surface repair-source pressure in default status output", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
     dbPaths.add(fixture.dbPath);
@@ -992,11 +1539,9 @@ describe("lcm command", () => {
       }),
     );
 
-    expect(result.text).toContain("tokens in context: 8");
-    expect(result.text).toContain("lcm health: warning");
-    expect(result.text).toContain(
-      "lcm reason: repair source token count 120,000 exceeds 75% of assembly budget 128,000",
-    );
+    expect(result.text).toContain("LCM frontier tokens: 8");
+    expect(result.text).toContain("lcm health: healthy");
+    expect(result.text).not.toContain("repair source token count");
   });
 
   it("does not treat stale idle maintenance token counts as degraded status", async () => {
@@ -1054,9 +1599,14 @@ describe("lcm command", () => {
       }),
     );
 
-    expect(result.text).toContain("tokens in context: 8");
+    expect(result.text).toContain("LCM frontier tokens: 8");
     expect(result.text).toContain("state: idle");
-    expect(result.text).toContain("observed token count: 150");
+    expect(result.text).toContain(
+      `last finished: ${formatTimestamp(new Date("2026-04-12T00:07:00.000Z"), fixture.config.timezone)}`,
+    );
+    expect(result.text).toContain("budget: 100");
+    expect(result.text).not.toContain("observed token count: 150");
+    expect(result.text).not.toContain("projected token count: 150");
     expect(result.text).toContain("lcm health: healthy");
     expect(result.text).not.toContain("lcm reason: observed token count 150");
   });
@@ -1095,7 +1645,7 @@ describe("lcm command", () => {
     expect(result.text).not.toContain("session id:");
     expect(result.text).toContain("session key: missing");
     expect(result.text).toContain("messages: 1");
-    expect(result.text).toContain("tokens in context: 0");
+    expect(result.text).toContain("LCM frontier tokens: 0");
     expect(result.text).toContain("compression ratio: n/a");
   });
 
@@ -1199,7 +1749,12 @@ describe("lcm command", () => {
       "sum_current_directive (fallback), sum_current_emergency (emergency), sum_current_new (new), sum_current_old (old)",
     );
     expect(result.text).toContain("**🛠️ Next step**");
-    expect(result.text).toContain("`/lossless doctor apply` repairs these in place for the current conversation.");
+    expect(result.text).toContain(
+      "`/lossless doctor apply` repairs these in place for the current conversation.",
+    );
+    expect(result.text).toContain(
+      "`/lossless doctor apply <conversation-id> confirm-offline`",
+    );
     expect(result.text).not.toContain("sum_other_new");
     expect(result.text).not.toContain(`conversation id: ${otherConversation.conversationId}`);
   });
@@ -1260,6 +1815,457 @@ describe("lcm command", () => {
     expect(result.text).not.toContain("sum_unknown_clean");
   });
 
+  it("reports whole-DB rollover split memory even when no current conversation is resolved", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const sessionKey = "agent:main:test:rollover-detect";
+    const archived = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-detect-old",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: archived.conversationId,
+      label: "detect_old",
+      includeSummary: true,
+    });
+    await fixture.conversationStore.archiveConversation(archived.conversationId, "rollover-fallback");
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-detect-new",
+      sessionKey,
+    });
+    setConversationTimes(fixture, archived.conversationId, "2026-06-17 01:00:00", "2026-06-17 01:05:00");
+    setConversationTimes(fixture, active.conversationId, "2026-06-17 01:06:00");
+
+    const result = await fixture.command.handler(createCommandContext("doctor"));
+
+    expect(result.text).toContain("Summary doctor is conversation-scoped.");
+    expect(result.text).toContain("**⚠️ Rollover split memory**");
+    expect(result.text).toContain("affected safe lanes: 1");
+    expect(result.text).toContain("stranded: 1 messages · 1 summaries · 2 context items");
+    expect(result.text).toContain("repair: `/lossless doctor apply rollover-splits confirm`");
+    expect(result.text).toContain("rollover-detect");
+  });
+
+  it("repairs safe whole-DB rollover splits after confirmation", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const sessionKey = "agent:main:test:rollover-apply";
+    const firstArchived = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-apply-old-1",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: firstArchived.conversationId,
+      label: "oldone",
+      transcriptEntryId: "entry_oldone",
+      includeSummary: true,
+      includeLargeFile: true,
+      includeFocusBrief: true,
+    });
+    await fixture.conversationStore.archiveConversation(firstArchived.conversationId, "rollover-fallback");
+
+    const secondArchived = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-apply-old-2",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: secondArchived.conversationId,
+      label: "oldtwo",
+      includeSummary: true,
+    });
+    await fixture.conversationStore.archiveConversation(secondArchived.conversationId, "rollover-fallback");
+
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-apply-new",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: active.conversationId,
+      label: "active",
+      includeSummary: true,
+    });
+    const unrelated = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-apply-unrelated",
+      sessionKey: "agent:main:test:rollover-apply-unrelated",
+    });
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: unrelated.conversationId,
+        seq: 0,
+        role: "tool",
+        content:
+          "[LCM Tool Output: tool_1]\nCall lcm_describe(id=\"tool_1\") to inspect the full payload.\nExploration Summary:\npayloaddelta retained content",
+        tokenCount: 9,
+      },
+    ]);
+    setConversationTimes(fixture, firstArchived.conversationId, "2026-06-17 01:00:00", "2026-06-17 01:05:00");
+    setConversationTimes(fixture, secondArchived.conversationId, "2026-06-17 01:06:00", "2026-06-17 01:10:00");
+    setConversationTimes(fixture, active.conversationId, "2026-06-17 01:11:00");
+    insertRolloverStateRows(fixture, firstArchived.conversationId, active.conversationId);
+
+    // Pending compaction rows are ordinal-keyed prepared work; the repair must
+    // treat them as handled (lane stays safe) and drop them for the whole lane.
+    const sourceMessage = fixture.db
+      .prepare(`SELECT message_id FROM messages WHERE conversation_id = ? LIMIT 1`)
+      .get(firstArchived.conversationId) as { message_id: number };
+    await fixture.conversationStore.upsertMessageTranscriptAnchorTrust({
+      messageId: sourceMessage.message_id,
+      conversationId: firstArchived.conversationId,
+      transcriptEntryId: "entry_oldone",
+      trustState: "verified",
+      source: "test",
+      reason: "source rollover anchor",
+    });
+    await fixture.conversationStore.upsertConversationTranscriptEpoch({
+      conversationId: firstArchived.conversationId,
+      sessionId: firstArchived.sessionId,
+      sessionKey: firstArchived.sessionKey,
+      migrationMode: "legacy_prefix",
+      metadata: { reason: "source rollover epoch" },
+    });
+    for (const [batchId, conversationId] of [
+      ["pcb_rollover_source", firstArchived.conversationId],
+      ["pcb_rollover_target", active.conversationId],
+    ] as const) {
+      fixture.db
+        .prepare(
+          `INSERT INTO pending_compaction_batches (
+             batch_id, conversation_id, status, source_projection_fingerprint,
+             compactable_start_ordinal, compactable_end_ordinal, prompt_version, model
+           ) VALUES (?, ?, 'ready', 'fp', 0, 1, 'test', 'test-model')`,
+        )
+        .run(batchId, conversationId);
+      fixture.db
+        .prepare(
+          `INSERT INTO pending_summary_nodes (
+             node_id, batch_id, conversation_id, kind, depth, status,
+             ordinal_start, ordinal_end, source_fingerprint, prompt_version, model
+           ) VALUES (?, ?, ?, 'leaf', 0, 'ready', 0, 1, 'fp', 'test', 'test-model')`,
+        )
+        .run(`${batchId}-node`, batchId, conversationId);
+    }
+    fixture.db
+      .prepare(
+        `INSERT INTO pending_summary_node_messages (node_id, message_id, ordinal)
+         VALUES ('pcb_rollover_source-node', ?, 0)`,
+      )
+      .run(sourceMessage.message_id);
+
+    const blocked = await fixture.command.handler(
+      createCommandContext("doctor apply rollover-splits"),
+    );
+    expect(blocked.text).toContain("status: blocked");
+    expect(blocked.text).toContain("read-only; no rollover split repair ran");
+
+    const result = await fixture.command.handler(
+      createCommandContext("doctor apply rollover-splits confirm"),
+    );
+
+    expect(result.text).toContain("status: completed");
+    expect(result.text).toContain("repaired lanes: 1");
+    expect(result.text).toContain("merged: 2 messages · 2 summaries · 4 context items · 1 large files · 1 focus briefs");
+    expect(result.text).toContain("integrity: ok");
+    expect(result.text).toContain("foreign keys: clean");
+    expect(result.text).toContain("backup path:");
+    expect(result.text).not.toContain("backup path: skipped");
+
+    const targetMessages = fixture.db
+      .prepare(
+        `SELECT seq, content
+         FROM messages
+         WHERE conversation_id = ?
+         ORDER BY seq ASC`,
+      )
+      .all(active.conversationId) as Array<{ seq: number; content: string }>;
+    expect(targetMessages).toEqual([
+      { seq: 1, content: "oldone message" },
+      { seq: 2, content: "oldtwo message" },
+      { seq: 3, content: "active message" },
+    ]);
+    await expect(
+      fixture.conversationStore.getMessageTranscriptAnchorTrust(sourceMessage.message_id),
+    ).resolves.toMatchObject({
+      conversationId: active.conversationId,
+      transcriptEntryId: "entry_oldone",
+      trustState: "verified",
+    });
+    await expect(
+      fixture.conversationStore.getConversationTranscriptEpoch(active.conversationId),
+    ).resolves.toMatchObject({
+      conversationId: active.conversationId,
+      migrationMode: "legacy_prefix",
+      metadata: {
+        reason: "rollover split repair merged transcript epoch state",
+        sourceConversationIds: [firstArchived.conversationId, secondArchived.conversationId],
+      },
+    });
+    await expect(
+      fixture.conversationStore.getConversationTranscriptEpoch(firstArchived.conversationId),
+    ).resolves.toBeNull();
+
+    const targetContext = fixture.db
+      .prepare(
+        `SELECT ordinal, item_type
+         FROM context_items
+         WHERE conversation_id = ?
+         ORDER BY ordinal ASC`,
+      )
+      .all(active.conversationId) as Array<{ ordinal: number; item_type: string }>;
+    expect(targetContext.map((row) => row.ordinal)).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(targetContext.map((row) => row.item_type)).toEqual([
+      "message",
+      "summary",
+      "message",
+      "summary",
+      "message",
+      "summary",
+    ]);
+
+    const counts = fixture.db
+      .prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM summaries WHERE conversation_id = ?) AS summaries,
+           (SELECT COUNT(*) FROM large_files WHERE conversation_id = ?) AS large_files,
+           (SELECT COUNT(*) FROM focus_briefs WHERE conversation_id = ?) AS focus_briefs,
+           (SELECT COUNT(*) FROM messages WHERE conversation_id IN (?, ?)) AS source_messages,
+           (SELECT COUNT(*) FROM context_items WHERE conversation_id IN (?, ?)) AS source_context,
+           (SELECT COUNT(*) FROM conversation_compaction_telemetry WHERE conversation_id = ?) AS source_telemetry`,
+      )
+      .get(
+        active.conversationId,
+        active.conversationId,
+        active.conversationId,
+        firstArchived.conversationId,
+        secondArchived.conversationId,
+        firstArchived.conversationId,
+        secondArchived.conversationId,
+        firstArchived.conversationId,
+      ) as {
+      summaries: number;
+      large_files: number;
+      focus_briefs: number;
+      source_messages: number;
+      source_context: number;
+      source_telemetry: number;
+    };
+    expect(counts).toEqual({
+      summaries: 3,
+      large_files: 1,
+      focus_briefs: 1,
+      source_messages: 0,
+      source_context: 0,
+      source_telemetry: 0,
+    });
+
+    const maintenance = fixture.db
+      .prepare(
+        `SELECT pending, reason, running, resolution_reason, resolved_at, maintenance_revision
+         FROM conversation_compaction_maintenance
+         WHERE conversation_id = ?`,
+      )
+      .get(active.conversationId) as {
+      pending: number;
+      reason: string;
+      running: number;
+      resolution_reason: string | null;
+      resolved_at: string | null;
+      maintenance_revision: number;
+    };
+    expect(maintenance).toEqual({
+      pending: 1,
+      reason: "doctor-rollover-split-repair",
+      running: 0,
+      resolution_reason: null,
+      resolved_at: null,
+      maintenance_revision: 8,
+    });
+
+    const pendingCounts = fixture.db
+      .prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM pending_compaction_batches) AS batches,
+           (SELECT COUNT(*) FROM pending_summary_nodes) AS nodes,
+           (SELECT COUNT(*) FROM pending_summary_node_messages) AS node_messages`,
+      )
+      .get() as { batches: number; nodes: number; node_messages: number };
+    expect(pendingCounts).toEqual({ batches: 0, nodes: 0, node_messages: 0 });
+
+    const ftsRows = fixture.db
+      .prepare(`SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'oldone'`)
+      .all();
+    expect(ftsRows.length).toBeGreaterThan(0);
+    const retainedFtsRows = fixture.db
+      .prepare(`SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'payloaddelta'`)
+      .all();
+    expect(retainedFtsRows.length).toBeGreaterThan(0);
+    const helperFtsRows = fixture.db
+      .prepare(`SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'lcm_describe'`)
+      .all();
+    expect(helperFtsRows).toEqual([]);
+  });
+
+  it("repairs rollover splits when unrelated foreign key issues already exist", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const sessionKey = "agent:main:test:rollover-preexisting-fk";
+    const archived = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-preexisting-fk-old",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: archived.conversationId,
+      label: "oldfk",
+      includeSummary: true,
+    });
+    await fixture.conversationStore.archiveConversation(archived.conversationId, "rollover-fallback");
+
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-preexisting-fk-new",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: active.conversationId,
+      label: "activefk",
+      includeSummary: true,
+    });
+    setConversationTimes(fixture, archived.conversationId, "2026-06-17 02:00:00", "2026-06-17 02:05:00");
+    setConversationTimes(fixture, active.conversationId, "2026-06-17 02:10:00");
+
+    // Simulate an unrelated live-DB orphan that predates rollover repair.
+    fixture.db.exec(`PRAGMA foreign_keys = OFF`);
+    fixture.db
+      .prepare(
+        `INSERT INTO message_parts (
+           part_id,
+           message_id,
+           session_id,
+           part_type,
+           ordinal,
+           text_content
+         ) VALUES ('orphan-preexisting-part', 9999999, 'orphan-session', 'text', 0, 'orphaned')`,
+      )
+      .run();
+    fixture.db.exec(`PRAGMA foreign_keys = ON`);
+
+    const beforeIssues = fixture.db.prepare(`PRAGMA foreign_key_check`).all();
+    expect(beforeIssues).toHaveLength(1);
+
+    const result = await fixture.command.handler(
+      createCommandContext("doctor apply rollover-splits confirm"),
+    );
+
+    expect(result.text).toContain("status: completed");
+    expect(result.text).toContain("repaired lanes: 1");
+    expect(result.text).toContain("foreign keys: unchanged (1 foreign key issue(s) pre-existing)");
+
+    const targetMessages = fixture.db
+      .prepare(
+        `SELECT content
+         FROM messages
+         WHERE conversation_id = ?
+         ORDER BY seq ASC`,
+      )
+      .all(active.conversationId) as Array<{ content: string }>;
+    expect(targetMessages.map((row) => row.content)).toEqual(["oldfk message", "activefk message"]);
+    expect(fixture.db.prepare(`PRAGMA foreign_key_check`).all()).toEqual(beforeIssues);
+  });
+
+  it("skips rollover split repair when transcript entry ids collide", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const sessionKey = "agent:main:test:rollover-collision";
+    const archived = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-collision-old",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: archived.conversationId,
+      label: "collision_old",
+      transcriptEntryId: "duplicate-entry-id",
+    });
+    await fixture.conversationStore.archiveConversation(archived.conversationId, "rollover-fallback");
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "rollover-collision-new",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: active.conversationId,
+      label: "collision_active",
+      transcriptEntryId: "duplicate-entry-id",
+    });
+    setConversationTimes(fixture, archived.conversationId, "2026-06-17 02:00:00", "2026-06-17 02:05:00");
+    setConversationTimes(fixture, active.conversationId, "2026-06-17 02:06:00");
+
+    const scan = await fixture.command.handler(createCommandContext("doctor rollover-splits"));
+    expect(scan.text).toContain("affected safe lanes: 0");
+    expect(scan.text).toContain("needs review: 1");
+
+    const result = await fixture.command.handler(
+      createCommandContext("doctor apply rollover-splits confirm"),
+    );
+    expect(result.text).toContain("repaired lanes: 0");
+    expect(result.text).toContain("skipped for review: 1");
+    expect(result.text).toContain("backup path: skipped (no safe rollover splits)");
+
+    const archivedMessageCount = fixture.db
+      .prepare(`SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?`)
+      .get(archived.conversationId) as { count: number };
+    expect(archivedMessageCount.count).toBe(1);
+  });
+
+  it("ignores isolated cron session-key rollovers", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const sessionKey = "agent:main:cron:rollover-nightly";
+    const archived = await fixture.conversationStore.createConversation({
+      sessionId: "cron-rollover-old",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: archived.conversationId,
+      label: "cron_old",
+      includeSummary: true,
+      includeFocusBrief: true,
+    });
+    await fixture.conversationStore.archiveConversation(archived.conversationId, "rollover-fallback");
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "cron-rollover-new",
+      sessionKey,
+    });
+    await createRolloverConversationData(fixture, {
+      conversationId: active.conversationId,
+      label: "cron_active",
+    });
+    setConversationTimes(fixture, archived.conversationId, "2026-06-17 03:00:00", "2026-06-17 03:05:00");
+    setConversationTimes(fixture, active.conversationId, "2026-06-17 03:06:00");
+
+    const scan = await fixture.command.handler(createCommandContext("doctor rollover-splits"));
+    expect(scan.text).toContain("result: clean");
+    expect(scan.text).toContain("safe lanes: 0");
+    expect(scan.text).toContain("needs review: 0");
+
+    const result = await fixture.command.handler(
+      createCommandContext("doctor apply rollover-splits confirm"),
+    );
+    expect(result.text).toContain("repaired lanes: 0");
+    expect(result.text).toContain("backup path: skipped (no safe rollover splits)");
+
+    const archivedMessageCount = fixture.db
+      .prepare(`SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?`)
+      .get(archived.conversationId) as { count: number };
+    expect(archivedMessageCount.count).toBe(1);
+  });
+
   it("reports doctor as unavailable when the current conversation cannot be resolved", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
@@ -1291,7 +2297,8 @@ describe("lcm command", () => {
     expect(result.text).toContain(
       "No LCM conversation is stored yet for active session key `agent:main:telegram:direct:not-stored` or active session id `doctor-unresolved-missing`.",
     );
-    expect(result.text).toContain("fallback: Doctor is conversation-scoped, so no global scan ran.");
+    expect(result.text).toContain("fallback: Summary doctor is conversation-scoped.");
+    expect(result.text).toContain("**✅ Rollover split memory**");
     expect(result.text).not.toContain("detected summaries:");
     expect(result.text).not.toContain("sum_unresolved_other");
   });
@@ -1314,7 +2321,7 @@ describe("lcm command", () => {
         tokenCount: 4,
       },
     ]);
-    await fixture.conversationStore.archiveConversation(archivedSubagent.conversationId);
+    await fixture.conversationStore.archiveConversation(archivedSubagent.conversationId, "rollover-fallback");
 
     const cronConversation = await fixture.conversationStore.createConversation({
       sessionId: "doctor-cleaner-cron",
@@ -1364,7 +2371,7 @@ describe("lcm command", () => {
       },
     ]);
 
-    await fixture.conversationStore.archiveConversation(nullSubagent.conversationId);
+    await fixture.conversationStore.archiveConversation(nullSubagent.conversationId, "rollover-fallback");
 
     const liveNullSubagent = await fixture.conversationStore.createConversation({
       sessionId: "doctor-cleaner-live-null-subagent",
@@ -1402,6 +2409,104 @@ describe("lcm command", () => {
     expect(result.text).not.toContain("\"[Subagent Context] Live child session still in progress.\"");
     expect(result.text).not.toContain("doctor-cleaner-normal");
     expect(result.text).not.toContain("ordinary conversation");
+  });
+
+  it("matches cron and archived-subagent keys for configured agent ids only", async () => {
+    const fixture = createCommandFixture({
+      openClawConfig: {
+        agents: {
+          list: [{ id: "ops" }, { id: "qa" }],
+        },
+      },
+    });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const matchingKeys = [
+      "agent:ops:cron:nightly",
+      "agent:qa:cron:weekly:run:run-1",
+      "agent:ops:subagent:archived-worker",
+    ];
+    for (const [index, sessionKey] of matchingKeys.entries()) {
+      const conversation = await fixture.conversationStore.createConversation({
+        sessionId: `doctor-configured-match-${index}`,
+        sessionKey,
+      });
+      await fixture.conversationStore.createMessagesBulk([
+        {
+          conversationId: conversation.conversationId,
+          seq: 0,
+          role: "assistant",
+          content: `configured match ${index}`,
+          tokenCount: 3,
+        },
+      ]);
+      if (sessionKey.includes(":subagent:")) {
+        await fixture.conversationStore.archiveConversation(
+          conversation.conversationId,
+          "rollover-fallback",
+        );
+      }
+    }
+
+    const activeSubagent = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-configured-active-subagent",
+      sessionKey: "agent:qa:subagent:active-worker",
+    });
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: activeSubagent.conversationId,
+        seq: 0,
+        role: "assistant",
+        content: "active configured subagent",
+        tokenCount: 3,
+      },
+    ]);
+
+    const excludedKeys = [
+      "agent:main:cron:unconfigured",
+      "agent:OPS:cron:different-case",
+      "agent:ops-admin:cron:other-agent",
+      "agent:ops:channel:cron:nested-lane",
+      "agent:qa:channel:subagent:nested-lane",
+      "agent:ops:cron:",
+      "agent:qa:subagent:",
+      "agent::cron:missing-agent",
+      "ops:cron:missing-agent-prefix",
+    ];
+    for (const [index, sessionKey] of excludedKeys.entries()) {
+      const conversation = await fixture.conversationStore.createConversation({
+        sessionId: `doctor-configured-excluded-${index}`,
+        sessionKey,
+      });
+      await fixture.conversationStore.createMessagesBulk([
+        {
+          conversationId: conversation.conversationId,
+          seq: 0,
+          role: "assistant",
+          content: `excluded shape ${index}`,
+          tokenCount: 3,
+        },
+      ]);
+      if (sessionKey.includes(":subagent:")) {
+        await fixture.conversationStore.archiveConversation(
+          conversation.conversationId,
+          "rollover-fallback",
+        );
+      }
+    }
+
+    const result = await fixture.command.handler(createCommandContext("doctor clean"));
+
+    expect(result.text).toContain("matched conversations: 3");
+    expect(result.text).toContain("matched messages: 3");
+    for (const sessionKey of matchingKeys) {
+      expect(result.text).toContain(sessionKey);
+    }
+    expect(result.text).not.toContain("agent:qa:subagent:active-worker");
+    for (const sessionKey of excludedKeys) {
+      expect(result.text).not.toContain(`session key \`${sessionKey}\``);
+    }
   });
 
   it("reports a clean doctor clean scan when no high-confidence candidates exist", async () => {
@@ -1450,7 +2555,7 @@ describe("lcm command", () => {
         tokenCount: 5,
       },
     ]);
-    await fixture.conversationStore.archiveConversation(archivedSubagent.conversationId);
+    await fixture.conversationStore.archiveConversation(archivedSubagent.conversationId, "rollover-fallback");
 
     const cronConversation = await fixture.conversationStore.createConversation({
       sessionId: "doctor-cleaner-apply-cron",
@@ -1485,7 +2590,7 @@ describe("lcm command", () => {
         tokenCount: 4,
       },
     ]);
-    await fixture.conversationStore.archiveConversation(nullSubagent.conversationId);
+    await fixture.conversationStore.archiveConversation(nullSubagent.conversationId, "rollover-fallback");
 
     const liveNullSubagent = await fixture.conversationStore.createConversation({
       sessionId: "doctor-cleaner-apply-live-null",
@@ -1521,6 +2626,7 @@ describe("lcm command", () => {
       },
     ]);
 
+    const execSpy = vi.spyOn(fixture.db, "exec");
     const result = await fixture.command.handler(createCommandContext("doctor clean apply"));
 
     const backupPath = result.text.match(/backup path: (.+)/)?.[1]?.trim();
@@ -1545,6 +2651,120 @@ describe("lcm command", () => {
     expect(removedArchived).toBeNull();
     expect(removedCron).toBeNull();
     expect(removedNull).toBeNull();
+    const executedSql = execSpy.mock.calls.map(([sql]) => String(sql));
+    expect(executedSql.findIndex((sql) => sql.startsWith("VACUUM INTO "))).toBeLessThan(
+      executedSql.indexOf("BEGIN IMMEDIATE"),
+    );
+  });
+
+  it("applies exactly the configured-agent candidates reported by doctor clean", async () => {
+    const fixture = createCommandFixture({
+      openClawConfig: {
+        agents: {
+          list: [{ id: "main" }],
+        },
+      },
+    });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const cron = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-configured-apply-cron",
+      sessionKey: "agent:ops:cron:apply-nightly",
+    });
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: cron.conversationId,
+        seq: 0,
+        role: "assistant",
+        content: "configured cron candidate",
+        tokenCount: 4,
+      },
+    ]);
+
+    const archivedSubagent = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-configured-apply-subagent",
+      sessionKey: "agent:qa:subagent:apply-worker",
+    });
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: archivedSubagent.conversationId,
+        seq: 0,
+        role: "assistant",
+        content: "configured archived subagent candidate",
+        tokenCount: 5,
+      },
+    ]);
+    await fixture.conversationStore.archiveConversation(
+      archivedSubagent.conversationId,
+      "rollover-fallback",
+    );
+
+    const activeSubagent = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-configured-apply-active",
+      sessionKey: "agent:qa:subagent:active-worker",
+    });
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: activeSubagent.conversationId,
+        seq: 0,
+        role: "assistant",
+        content: "active configured subagent",
+        tokenCount: 4,
+      },
+    ]);
+
+    const unrelated = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-configured-apply-unrelated",
+      sessionKey: "agent:ops:channel:cron:not-a-cron-lane",
+    });
+    await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: unrelated.conversationId,
+        seq: 0,
+        role: "assistant",
+        content: "unrelated nested cron segment",
+        tokenCount: 4,
+      },
+    ]);
+
+    const commandConfig = {
+      agents: {
+        list: [{ id: "ops" }, { id: "qa" }],
+      },
+      plugins: {
+        entries: {
+          "lossless-claw": {
+            enabled: true,
+          },
+        },
+        slots: {
+          contextEngine: "lossless-claw",
+        },
+      },
+    };
+    const scan = await fixture.command.handler(
+      createCommandContext("doctor clean", { config: commandConfig }),
+    );
+    const apply = await fixture.command.handler(
+      createCommandContext("doctor clean apply", { config: commandConfig }),
+    );
+
+    expect(scan.text).toContain("matched conversations: 2");
+    expect(scan.text).toContain("matched messages: 2");
+    expect(apply.text).toContain("matched conversations before apply: 2");
+    expect(apply.text).toContain("deleted conversations: 2");
+    expect(apply.text).toContain("deleted messages: 2");
+    await expect(fixture.conversationStore.getConversation(cron.conversationId)).resolves.toBeNull();
+    await expect(
+      fixture.conversationStore.getConversation(archivedSubagent.conversationId),
+    ).resolves.toBeNull();
+    await expect(
+      fixture.conversationStore.getConversation(activeSubagent.conversationId),
+    ).resolves.not.toBeNull();
+    await expect(
+      fixture.conversationStore.getConversation(unrelated.conversationId),
+    ).resolves.not.toBeNull();
   });
 
   it("applies a single doctor clean filter without deleting other candidate classes", async () => {
@@ -1565,7 +2785,7 @@ describe("lcm command", () => {
         tokenCount: 5,
       },
     ]);
-    await fixture.conversationStore.archiveConversation(archivedSubagent.conversationId);
+    await fixture.conversationStore.archiveConversation(archivedSubagent.conversationId, "rollover-fallback");
 
     const cronConversation = await fixture.conversationStore.createConversation({
       sessionId: "doctor-cleaner-single-cron",
@@ -1706,10 +2926,57 @@ describe("lcm command", () => {
 
     expect(result.text).toContain("🩺 Lossless Claw Doctor Apply");
     expect(result.text).toContain("scope: this conversation only");
-    expect(result.text).toContain("detected summaries: 0");
+    expect(result.text).toContain("repair targets: 0");
     expect(result.text).toContain("repaired summaries: 0");
     expect(result.text).toContain("result: clean; no writes ran");
     expect(summarize).not.toHaveBeenCalled();
+  });
+
+  it("does not block doctor apply solely because the conversation has many unrelated messages", async () => {
+    const summarize = vi.fn(async () => "small scoped repair");
+    const fixture = createCommandFixture({ summarize: summarize as LcmSummarizeFn });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-apply-large-message-count",
+      sessionKey: "agent:main:telegram:direct:doctor-apply-large-message-count",
+    });
+    const messages = await fixture.conversationStore.createMessagesBulk(
+      Array.from({ length: 1_001 }, (_, index) => ({
+        conversationId: currentConversation.conversationId,
+        seq: index,
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: `unrelated message ${index}`,
+        tokenCount: 1,
+      })),
+    );
+    await fixture.summaryStore.insertSummary({
+      summaryId: "sum_large_message_count",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: `broken leaf\n${"[Truncated from 512 tokens]"}`,
+      tokenCount: 11,
+      sourceMessageTokenCount: 1,
+    });
+    await fixture.summaryStore.linkSummaryToMessages("sum_large_message_count", [
+      messages[0].messageId,
+    ]);
+
+    const result = await fixture.command.handler(
+      createCommandContext("doctor apply", {
+        sessionKey: "agent:main:telegram:direct:doctor-apply-large-message-count",
+      }),
+    );
+
+    const repaired = await fixture.summaryStore.getSummary("sum_large_message_count");
+    expect(result.text).toContain("repair targets: 1");
+    expect(result.text).toContain("repaired summaries: 1");
+    expect(result.text).not.toContain("Safety preflight");
+    expect(result.text).not.toContain("message count");
+    expect(summarize).toHaveBeenCalledTimes(1);
+    expect(repaired?.content).toBe("small scoped repair");
   });
 
   it("blocks doctor apply for large scoped repairs before summarizer or writes run", async () => {
@@ -1745,7 +3012,9 @@ describe("lcm command", () => {
     expect(result.text).toContain("**🧯 Safety preflight**");
     expect(result.text).toContain("status: blocked");
     expect(result.text).toContain("mode: read-only; no summary rewrites ran");
-    expect(result.text).toContain("detected summaries: 26");
+    expect(result.text).toContain("repair targets: 26");
+    expect(result.text).not.toContain("repair input tokens");
+    expect(result.text).not.toContain("repair target source tokens");
     expect(result.text).toContain("doctor target count 26 exceeds safe inline limit 25");
     expect(result.text).toContain("`/lossless doctor apply confirm-offline`");
     expect(summarize).not.toHaveBeenCalled();
@@ -1812,10 +3081,98 @@ describe("lcm command", () => {
 
     const unchanged = await fixture.summaryStore.getSummary("sum_pending_maintenance");
     expect(result.text).toContain("status: blocked");
+    expect(result.text).toContain("repair targets: 1");
+    expect(result.text).toContain("repair input tokens: 7");
+    expect(result.text).toContain("repair target source tokens: 7");
     expect(result.text).toContain("compaction maintenance is pending (budget-trigger)");
-    expect(result.text).toContain("observed token count 96,001 exceeds 75% of repair budget 128,000");
+    expect(result.text).not.toContain("observed token count");
+    expect(result.text).not.toContain("message count");
     expect(summarize).not.toHaveBeenCalled();
     expect(unchanged?.content).toContain("[Truncated from 512 tokens]");
+  });
+
+  it("reports condensed doctor repair input separately from target source coverage", async () => {
+    const summarize = vi.fn(async () => "should not run");
+    const fixture = createCommandFixture({ summarize: summarize as LcmSummarizeFn });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-apply-condensed-metrics",
+      sessionKey: "agent:main:telegram:direct:doctor-apply-condensed-metrics",
+    });
+    const messages = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "first condensed source",
+        tokenCount: 100,
+      },
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: "second condensed source",
+        tokenCount: 200,
+      },
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "sum_condensed_metrics_child",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "healthy child summary",
+      tokenCount: 12,
+      sourceMessageTokenCount: 300,
+    });
+    await fixture.summaryStore.linkSummaryToMessages("sum_condensed_metrics_child", [
+      messages[0].messageId,
+      messages[1].messageId,
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "sum_condensed_metrics_parent",
+      conversationId: currentConversation.conversationId,
+      kind: "condensed",
+      depth: 1,
+      content: FALLBACK_DIRECTIVE_SUMMARY_MARKER,
+      tokenCount: 8,
+      sourceMessageTokenCount: 300,
+      descendantTokenCount: 12,
+    });
+    await fixture.summaryStore.linkSummaryToParents("sum_condensed_metrics_parent", [
+      "sum_condensed_metrics_child",
+    ]);
+    fixture.db
+      .prepare(
+        `INSERT INTO conversation_compaction_maintenance (
+           conversation_id,
+           pending,
+           requested_at,
+           reason,
+           running,
+           updated_at
+         ) VALUES (?, 1, ?, ?, 0, datetime('now'))`,
+      )
+      .run(
+        currentConversation.conversationId,
+        "2026-04-12T00:00:00.000Z",
+        "budget-trigger",
+      );
+
+    const result = await fixture.command.handler(
+      createCommandContext("doctor apply", {
+        sessionKey: "agent:main:telegram:direct:doctor-apply-condensed-metrics",
+      }),
+    );
+
+    expect(result.text).toContain("status: blocked");
+    expect(result.text).toContain("repair targets: 1");
+    expect(result.text).toContain("repair input tokens: 12");
+    expect(result.text).toContain("repair target source tokens: 300");
+    expect(result.text).toContain("compaction maintenance is pending (budget-trigger)");
+    expect(result.text).not.toContain("observed token count");
+    expect(summarize).not.toHaveBeenCalled();
   });
 
   it("blocks doctor apply when a broken leaf summary points at oversized raw source tokens", async () => {
@@ -1856,8 +3213,11 @@ describe("lcm command", () => {
 
     const unchanged = await fixture.summaryStore.getSummary("sum_raw_source_tokens");
     expect(result.text).toContain("status: blocked");
-    expect(result.text).toContain("detected summaries: 1");
-    expect(result.text).toContain("observed token count 120,000 exceeds 75% of repair budget 128,000");
+    expect(result.text).toContain("repair targets: 1");
+    expect(result.text).toContain("repair input tokens: 120,000");
+    expect(result.text).toContain("repair target source tokens: 120,000");
+    expect(result.text).toContain("repair input token count 120,000 exceeds 75% of repair budget 128,000");
+    expect(result.text).not.toContain("observed token count");
     expect(summarize).not.toHaveBeenCalled();
     expect(unchanged?.content).toContain("[Truncated from 512 tokens]");
   });
@@ -2011,7 +3371,7 @@ describe("lcm command", () => {
     const repairedEmergency = await fixture.summaryStore.getSummary("sum_emergency_fix");
     const repairedParent = await fixture.summaryStore.getSummary("sum_parent_fix");
 
-    expect(result.text).toContain("detected summaries: 3");
+    expect(result.text).toContain("repair targets: 3");
     expect(result.text).toContain("emergency-fallback summaries: 1");
     expect(result.text).toContain("repaired summaries: 3");
     expect(result.text).toContain("result: repaired 3 summary(s) in place");
@@ -2057,6 +3417,8 @@ describe("lcm command", () => {
     const untouched = await fixture.summaryStore.getSummary("sum_unresolved_apply_other");
 
     expect(result.text).toContain("🩺 Lossless Claw Doctor Apply");
+    expect(result.text).toContain("**📍 Current conversation**");
+    expect(result.text).not.toContain("**📍 Target conversation**");
     expect(result.text).toContain("status: unavailable");
     expect(result.text).toContain(
       "No LCM conversation is stored yet for active session key `agent:main:telegram:direct:not-stored` or active session id `doctor-apply-unresolved-missing`.",
@@ -2065,6 +3427,182 @@ describe("lcm command", () => {
     expect(result.text).not.toContain("detected summaries:");
     expect(summarize).not.toHaveBeenCalled();
     expect(untouched?.content).toContain("[Truncated from 204 tokens]");
+  });
+
+  it("requires offline confirmation before repairing a conversation by id", async () => {
+    const summarize = vi.fn(async () => "REPAIRED BY ID");
+    const fixture = createCommandFixture({ summarize: summarize as LcmSummarizeFn });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const currentConversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-apply-current-id",
+      sessionKey: "agent:main:telegram:direct:doctor-apply-current-id",
+    });
+    const otherConversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-apply-other-id",
+      sessionKey: "agent:main:telegram:direct:doctor-apply-other-id",
+    });
+
+    await fixture.summaryStore.insertSummary({
+      summaryId: "sum_current_id",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "healthy current summary",
+      tokenCount: 9,
+    });
+    const [message] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: otherConversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "other repair source",
+        tokenCount: 7,
+      },
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "sum_other_id",
+      conversationId: otherConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: `broken other summary\n${"[Truncated from 123 tokens]"}`,
+      tokenCount: 11,
+      sourceMessageTokenCount: 7,
+    });
+    await fixture.summaryStore.linkSummaryToMessages("sum_other_id", [message.messageId]);
+
+    const blocked = await fixture.command.handler(
+      createCommandContext(`doctor apply ${otherConversation.conversationId}`, {
+        sessionKey: "agent:main:telegram:direct:doctor-apply-current-id",
+      }),
+    );
+
+    const unchangedOther = await fixture.summaryStore.getSummary("sum_other_id");
+    expect(blocked.text).toContain("status: blocked");
+    expect(blocked.text).toContain("explicit conversation-id targeting requires `confirm-offline`");
+    expect(blocked.text).toContain(
+      `/lossless doctor apply ${otherConversation.conversationId} confirm-offline`,
+    );
+    expect(summarize).not.toHaveBeenCalled();
+    expect(unchangedOther?.content).toContain("[Truncated from 123 tokens]");
+
+    const result = await fixture.command.handler(
+      createCommandContext(
+        `doctor apply ${otherConversation.conversationId} confirm-offline`,
+        {
+          sessionKey: "agent:main:telegram:direct:doctor-apply-current-id",
+        },
+      ),
+    );
+
+    const repairedOther = await fixture.summaryStore.getSummary("sum_other_id");
+    const untouchedCurrent = await fixture.summaryStore.getSummary("sum_current_id");
+
+    expect(result.text).toContain("🩺 Lossless Claw Doctor Apply");
+    expect(result.text).toContain(`conversation id: ${otherConversation.conversationId}`);
+    expect(result.text).toContain("safety override: confirm-offline");
+    expect(result.text).toContain("repaired summaries: 1");
+    expect(summarize).toHaveBeenCalledTimes(1);
+    expect(repairedOther?.content).toContain("REPAIRED BY ID");
+    expect(repairedOther?.content).not.toContain("[Truncated from 123 tokens]");
+    expect(untouchedCurrent?.content).toBe("healthy current summary");
+  });
+
+  it("preserves a large targeted id through the blocked preflight and offline override", async () => {
+    const summarize = vi.fn(async (_text: string) => "TARGETED OFFLINE REPAIR");
+    const fixture = createCommandFixture({ summarize: summarize as LcmSummarizeFn });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const targetConversationId = 1_234;
+    fixture.db
+      .prepare(
+        `INSERT INTO conversations (conversation_id, session_id, session_key)
+         VALUES (?, ?, ?)`,
+      )
+      .run(
+        targetConversationId,
+        "doctor-apply-large-target-id",
+        "agent:main:telegram:direct:doctor-apply-large-target-id",
+      );
+
+    const messages = await fixture.conversationStore.createMessagesBulk(
+      Array.from({ length: 26 }, (_, index) => ({
+        conversationId: targetConversationId,
+        seq: index,
+        role: "user",
+        content: `targeted repair source ${index}`,
+        tokenCount: 5,
+      })),
+    );
+    for (let index = 0; index < 26; index += 1) {
+      const summaryId = `sum_large_targeted_${index}`;
+      await fixture.summaryStore.insertSummary({
+        summaryId,
+        conversationId: targetConversationId,
+        kind: "leaf",
+        depth: 0,
+        content: `broken targeted leaf ${index}\n${"[Truncated from 512 tokens]"}`,
+        tokenCount: 11,
+        sourceMessageTokenCount: 5,
+      });
+      await fixture.summaryStore.linkSummaryToMessages(summaryId, [messages[index].messageId]);
+    }
+    fixture.db
+      .prepare(
+        `INSERT INTO conversation_compaction_maintenance (
+           conversation_id,
+           pending,
+           requested_at,
+           reason,
+           running,
+           updated_at
+         ) VALUES (?, 1, ?, ?, 0, datetime('now'))`,
+      )
+      .run(targetConversationId, "2026-07-15T00:00:00.000Z", "budget-trigger");
+
+    const blocked = await fixture.command.handler(
+      createCommandContext(`doctor apply ${targetConversationId}`, {
+        sessionKey: "agent:main:telegram:direct:doctor-apply-caller",
+      }),
+    );
+
+    expect(blocked.text).toContain("status: blocked");
+    expect(blocked.text).toContain("repair targets: 26");
+    expect(blocked.text).toContain("explicit conversation-id targeting requires `confirm-offline`");
+    expect(blocked.text).toContain("doctor target count 26 exceeds safe inline limit 25");
+    expect(blocked.text).toContain("compaction maintenance is pending (budget-trigger)");
+    expect(blocked.text).toContain(`/lossless doctor apply ${targetConversationId} confirm-offline`);
+    expect(blocked.text).not.toContain("1,234 confirm-offline");
+    expect(summarize).not.toHaveBeenCalled();
+
+    const result = await fixture.command.handler(
+      createCommandContext(`doctor apply ${targetConversationId} confirm-offline`, {
+        sessionKey: "agent:main:telegram:direct:doctor-apply-caller",
+      }),
+    );
+
+    const repaired = await fixture.summaryStore.getSummary("sum_large_targeted_0");
+    expect(result.text).toContain("safety override: confirm-offline");
+    expect(result.text).toContain("repaired summaries: 26");
+    expect(summarize).toHaveBeenCalledTimes(26);
+    expect(repaired?.content).toBe("TARGETED OFFLINE REPAIR");
+  });
+
+  it("reports unavailable when targeting a nonexistent conversation id", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const result = await fixture.command.handler(
+      createCommandContext("doctor apply 99999", {
+        sessionKey: "agent:main:telegram:direct:doctor-apply-nonexistent",
+      }),
+    );
+
+    expect(result.text).toContain("🩺 Lossless Claw Doctor Apply");
+    expect(result.text).toContain("status: unavailable");
+    expect(result.text).toContain("No LCM conversation found with id 99,999");
   });
 
   it("uses the normal runtime model chain for doctor apply when no explicit summary model is set", async () => {
@@ -2089,8 +3627,6 @@ describe("lcm command", () => {
       buildSubagentSystemPrompt: vi.fn(() => "subagent prompt") as LcmDependencies["buildSubagentSystemPrompt"],
       readLatestAssistantReply: vi.fn(() => undefined) as LcmDependencies["readLatestAssistantReply"],
       resolveAgentDir: vi.fn(() => tmpdir()) as LcmDependencies["resolveAgentDir"],
-      resolveSessionIdFromSessionKey: vi.fn(async () => undefined) as LcmDependencies["resolveSessionIdFromSessionKey"],
-      resolveSessionTranscriptFile: vi.fn(async () => undefined) as LcmDependencies["resolveSessionTranscriptFile"],
       agentLaneSubagent: "subagent",
       log: {
         info: vi.fn(),
@@ -2172,6 +3708,340 @@ describe("lcm command", () => {
     expect(repaired?.content).not.toContain("[Truncated from 111 tokens]");
   });
 
+  it("reports transcript anchor audit counts without message content", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-anchor-audit",
+      sessionKey: "agent:main:telegram:direct:doctor-anchor-audit",
+    });
+    const [verified, suspect] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "sensitive content that must not appear",
+        tokenCount: 7,
+        transcriptEntryId: "entry_verified",
+      },
+      {
+        conversationId: conversation.conversationId,
+        seq: 1,
+        role: "assistant",
+        content: "",
+        tokenCount: 0,
+        transcriptEntryId: "entry_suspect",
+      },
+    ]);
+    await fixture.conversationStore.upsertMessageTranscriptAnchorTrust({
+      messageId: verified.messageId,
+      conversationId: conversation.conversationId,
+      transcriptEntryId: "entry_verified",
+      trustState: "verified",
+      source: "test",
+      reason: "verified test anchor",
+    });
+    await fixture.conversationStore.upsertMessageTranscriptAnchorTrust({
+      messageId: suspect.messageId,
+      conversationId: conversation.conversationId,
+      transcriptEntryId: "entry_suspect",
+      trustState: "suspect",
+      source: "test",
+      reason: "suspect test anchor",
+    });
+    await fixture.conversationStore.upsertConversationTranscriptEpoch({
+      conversationId: conversation.conversationId,
+      sessionId: conversation.sessionId,
+      sessionKey: conversation.sessionKey,
+      migrationMode: "legacy_prefix",
+      metadata: { reason: "test legacy prefix" },
+    });
+
+    const result = await fixture.command.handler(createCommandContext("doctor anchors"));
+
+    expect(result.text).toContain("🩺 Lossless Claw Anchor Audit");
+    expect(result.text).toContain("verified: 1");
+    expect(result.text).toContain("suspect: 1");
+    expect(result.text).toContain("legacy-prefix: 1");
+    expect(result.text).toContain("status: preserved with ignored legacy anchors");
+    expect(result.text).not.toContain("sensitive content");
+  });
+
+  it("reports active and inactive maintenance debt by reason without writing", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const maintenanceStore = new CompactionMaintenanceStore(fixture.db);
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-maintenance-active",
+      sessionKey: "agent:main:doctor-maintenance:active",
+    });
+    const inactiveThreshold = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-maintenance-inactive-threshold",
+      sessionKey: "agent:main:doctor-maintenance:inactive-threshold",
+    });
+    const inactiveBudget = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-maintenance-inactive-budget",
+      sessionKey: "agent:main:doctor-maintenance:inactive-budget",
+    });
+
+    await maintenanceStore.requestProactiveCompactionDebt({
+      conversationId: active.conversationId,
+      reason: "threshold",
+    });
+    await maintenanceStore.requestProactiveCompactionDebt({
+      conversationId: inactiveThreshold.conversationId,
+      reason: "threshold",
+    });
+    await maintenanceStore.requestProactiveCompactionDebt({
+      conversationId: inactiveBudget.conversationId,
+      reason: "budget-trigger",
+    });
+    await fixture.conversationStore.archiveConversation(
+      inactiveThreshold.conversationId,
+      "rollover-fallback",
+    );
+    await fixture.conversationStore.archiveConversation(
+      inactiveBudget.conversationId,
+      "rollover-fallback",
+    );
+    for (let index = 0; index < 4; index += 1) {
+      const extra = await fixture.conversationStore.createConversation({
+        sessionId: `doctor-maintenance-inactive-extra-${index}`,
+        sessionKey: `agent:main:doctor-maintenance:inactive-extra-${index}`,
+      });
+      await maintenanceStore.requestProactiveCompactionDebt({
+        conversationId: extra.conversationId,
+        reason: "threshold",
+      });
+      await fixture.conversationStore.archiveConversation(extra.conversationId, "rollover-fallback");
+    }
+    const before = fixture.db
+      .prepare(`SELECT * FROM conversation_compaction_maintenance ORDER BY conversation_id`)
+      .all();
+
+    const result = await fixture.command.handler(createCommandContext("doctor maintenance"));
+
+    expect(result.text).toContain("active actionable debt: 1");
+    expect(result.text).toContain("inactive historical debt: 6");
+    expect(result.text).toContain("active / threshold: 1");
+    expect(result.text).toContain("inactive / threshold: 5");
+    expect(result.text).toContain("inactive / budget-trigger: 1");
+    expect(result.text.match(/conversation \d+/g)).toHaveLength(5);
+    expect(result.text).toContain("... 1 more inactive row(s)");
+    expect(result.text).toContain("read-only scan; no maintenance state changed");
+    expect(
+      fixture.db.prepare(`SELECT * FROM conversation_compaction_maintenance ORDER BY conversation_id`).all(),
+    ).toEqual(before);
+  });
+
+  it("closes inactive maintenance debt after exact confirmation and a backup without changing recall data", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const maintenanceStore = new CompactionMaintenanceStore(fixture.db);
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-maintenance-apply",
+      sessionKey: "agent:main:doctor-maintenance:apply",
+    });
+    const message = await fixture.conversationStore.createMessage({
+      conversationId: conversation.conversationId,
+      seq: 0,
+      role: "user",
+      content: "valuable archived recall",
+      tokenCount: 4,
+    });
+    await fixture.summaryStore.insertSummary({
+      summaryId: "sum_doctor_maintenance_apply",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      content: "valuable summary",
+      tokenCount: 2,
+      sourceMessageTokenCount: 4,
+    });
+    await fixture.summaryStore.linkSummaryToMessages("sum_doctor_maintenance_apply", [message.messageId]);
+    await fixture.summaryStore.appendContextSummary(
+      conversation.conversationId,
+      "sum_doctor_maintenance_apply",
+    );
+    await maintenanceStore.requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+    });
+    await fixture.conversationStore.archiveConversation(conversation.conversationId, "rollover-fallback");
+    const countsBefore = fixture.db
+      .prepare(
+        `SELECT
+           (SELECT COUNT(*) FROM conversations) AS conversations,
+           (SELECT COUNT(*) FROM messages) AS messages,
+           (SELECT COUNT(*) FROM summaries) AS summaries,
+           (SELECT COUNT(*) FROM context_items) AS context_items`,
+      )
+      .get();
+
+    const missingConfirmation = await fixture.command.handler(
+      createCommandContext(`doctor apply maintenance ${conversation.conversationId}`),
+    );
+    expect(missingConfirmation.text).toContain("requires exact `confirm-inactive`");
+    expect(readdirSync(fixture.tempDir).filter((name) => name.endsWith(".bak"))).toHaveLength(0);
+
+    const applied = await fixture.command.handler(
+      createCommandContext(
+        `doctor apply maintenance ${conversation.conversationId} confirm-inactive`,
+      ),
+    );
+    const backupPath = applied.text.match(/backup path: (.+)/)?.[1]?.trim();
+    expect(applied.text).toContain("administratively closed");
+    expect(applied.text).toContain("did not compact or delete recall data");
+    expect(backupPath).toBeTruthy();
+    expect(existsSync(backupPath!)).toBe(true);
+    expect(await maintenanceStore.getConversationCompactionMaintenance(conversation.conversationId)).toMatchObject({
+      pending: false,
+      running: false,
+      reason: "threshold",
+      resolutionReason: "operator-ignored",
+    });
+    expect(
+      fixture.db
+        .prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM conversations) AS conversations,
+             (SELECT COUNT(*) FROM messages) AS messages,
+             (SELECT COUNT(*) FROM summaries) AS summaries,
+             (SELECT COUNT(*) FROM context_items) AS context_items`,
+        )
+        .get(),
+    ).toEqual(countsBefore);
+
+    const repeated = await fixture.command.handler(
+      createCommandContext(
+        `doctor apply maintenance ${conversation.conversationId} confirm-inactive`,
+      ),
+    );
+    expect(repeated.text).toContain("already resolved; no work performed");
+    expect(readdirSync(fixture.tempDir).filter((name) => name.endsWith(".bak"))).toHaveLength(1);
+  });
+
+  it("refuses active, running, unknown, and in-memory maintenance close targets without writes", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const maintenanceStore = new CompactionMaintenanceStore(fixture.db);
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-maintenance-refuse-active",
+      sessionKey: "agent:main:doctor-maintenance:refuse-active",
+    });
+    const running = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-maintenance-refuse-running",
+      sessionKey: "agent:main:doctor-maintenance:refuse-running",
+    });
+    await maintenanceStore.requestProactiveCompactionDebt({
+      conversationId: active.conversationId,
+      reason: "threshold",
+    });
+    await maintenanceStore.requestProactiveCompactionDebt({
+      conversationId: running.conversationId,
+      reason: "threshold",
+    });
+    await fixture.conversationStore.archiveConversation(running.conversationId, "rollover-fallback");
+    fixture.db.prepare(
+      `UPDATE conversation_compaction_maintenance SET running = 1 WHERE conversation_id = ?`,
+    ).run(running.conversationId);
+    const before = fixture.db
+      .prepare(`SELECT * FROM conversation_compaction_maintenance ORDER BY conversation_id`)
+      .all();
+
+    const activeResult = await fixture.command.handler(
+      createCommandContext(`doctor apply maintenance ${active.conversationId} confirm-inactive`),
+    );
+    const runningResult = await fixture.command.handler(
+      createCommandContext(`doctor apply maintenance ${running.conversationId} confirm-inactive`),
+    );
+    const unknownResult = await fixture.command.handler(
+      createCommandContext("doctor apply maintenance 999999 confirm-inactive"),
+    );
+    expect(activeResult.text).toContain("conversation is active");
+    expect(runningResult.text).toContain("maintenance is running");
+    expect(unknownResult.text).toContain("conversation was not found");
+    expect(
+      fixture.db.prepare(`SELECT * FROM conversation_compaction_maintenance ORDER BY conversation_id`).all(),
+    ).toEqual(before);
+    expect(readdirSync(fixture.tempDir).filter((name) => name.endsWith(".bak"))).toHaveLength(0);
+
+    const memoryDb = new DatabaseSync(":memory:");
+    runLcmMigrations(memoryDb);
+    const memoryConversationStore = new ConversationStore(memoryDb, {
+      fts5Available: getLcmDbFeatures(memoryDb).fts5Available,
+    });
+    const memoryConversation = await memoryConversationStore.createConversation({
+      sessionId: "doctor-maintenance-memory",
+      sessionKey: "agent:main:doctor-maintenance:memory",
+    });
+    const memoryMaintenanceStore = new CompactionMaintenanceStore(memoryDb);
+    await memoryMaintenanceStore.requestProactiveCompactionDebt({
+      conversationId: memoryConversation.conversationId,
+      reason: "threshold",
+    });
+    await memoryConversationStore.archiveConversation(
+      memoryConversation.conversationId,
+      "rollover-fallback",
+    );
+    const memoryCommand = createLcmCommand({
+      db: memoryDb,
+      config: resolveLcmConfig({}, { dbPath: ":memory:" }),
+    });
+    try {
+      const memoryResult = await memoryCommand.handler(
+        createCommandContext(
+          `doctor apply maintenance ${memoryConversation.conversationId} confirm-inactive`,
+        ),
+      );
+      expect(memoryResult.text).toContain("file-backed SQLite database");
+      expect(await memoryMaintenanceStore.getConversationCompactionMaintenance(
+        memoryConversation.conversationId,
+      )).toMatchObject({ pending: true, resolutionReason: null });
+    } finally {
+      memoryDb.close();
+    }
+  });
+
+  it("reports a guarded maintenance close failure after preserving the backup", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const maintenanceStore = new CompactionMaintenanceStore(fixture.db);
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "doctor-maintenance-close-failure",
+      sessionKey: "agent:main:doctor-maintenance:close-failure",
+    });
+    await maintenanceStore.requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+    });
+    await fixture.conversationStore.archiveConversation(conversation.conversationId, "rollover-fallback");
+    vi.spyOn(
+      CompactionMaintenanceStore.prototype,
+      "closeInactiveCompactionDebt",
+    ).mockRejectedValueOnce(new Error("database is locked"));
+
+    const result = await fixture.command.handler(
+      createCommandContext(
+        `doctor apply maintenance ${conversation.conversationId} confirm-inactive`,
+      ),
+    );
+
+    expect(result.text).toContain("guarded maintenance close failed: database is locked");
+    const backupPath = result.text.match(/backup path: (.+)/)?.[1]?.trim();
+    expect(backupPath).toBeTruthy();
+    expect(existsSync(backupPath!)).toBe(true);
+    expect(await maintenanceStore.getConversationCompactionMaintenance(conversation.conversationId)).toMatchObject({
+      pending: true,
+      resolutionReason: null,
+    });
+  });
+
   it("creates a standalone database backup", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
@@ -2202,530 +4072,6 @@ describe("lcm command", () => {
     expect(result.text).toContain("reason: disk full");
   });
 
-  it("rotates the current session and replaces the latest rotate backup", async () => {
-    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-${Date.now()}.jsonl`);
-    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
-    tempDirs.add(transcriptPath);
-
-    let currentConversationId = 0;
-    let mockedBackupPath = "";
-    const rotateSessionStorageWithBackup = vi.fn(async () => ({
-      kind: "rotated" as const,
-      currentConversationId,
-      currentMessageCount: 1,
-      backupPath: mockedBackupPath,
-      preservedTailMessageCount: 8,
-      checkpointSize: 1234,
-      bytesRemoved: 4567,
-    }));
-    const deps = {
-      resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
-      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
-    } as unknown as LcmDependencies;
-    const fixture = createCommandFixture({
-      deps,
-      getLcm: async () => ({
-        rotateSessionStorageWithBackup,
-      }),
-    });
-    tempDirs.add(fixture.tempDir);
-    dbPaths.add(fixture.dbPath);
-
-    const currentConversation = await fixture.conversationStore.createConversation({
-      sessionId: "rotate-session",
-      sessionKey: "agent:main:main",
-    });
-    currentConversationId = currentConversation.conversationId;
-    mockedBackupPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
-    writeFileSync(mockedBackupPath, "backup");
-    await fixture.conversationStore.createMessagesBulk([
-      {
-        conversationId: currentConversation.conversationId,
-        seq: 0,
-        role: "user",
-        content: "first message",
-        tokenCount: 2,
-      },
-    ]);
-
-    const result = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionId: "rotate-session",
-        sessionKey: "agent:main:main",
-      }),
-    );
-
-    const backupPath = result.text.match(/backup path: (.+)/)?.[1]?.trim();
-
-    expect(result.text).toContain("🪓 Lossless Claw Rotate");
-    expect(result.text).toContain("status: replaced latest");
-    expect(result.text).toContain("status: rotated");
-    expect(result.text).toContain("preserved tail messages: 8");
-    expect(result.text).toContain("bytes removed: 4,567");
-    expect(result.text).toContain("mode: preserved current conversation and rotated transcript tail");
-    expect(backupPath).toBeTruthy();
-    expect(backupPath?.endsWith(".rotate-latest.bak")).toBe(true);
-    expect(existsSync(backupPath!)).toBe(true);
-
-    const second = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionId: "rotate-session",
-        sessionKey: "agent:main:main",
-      }),
-    );
-    const secondBackupPath = second.text.match(/backup path: (.+)/)?.[1]?.trim();
-    expect(secondBackupPath).toBe(backupPath);
-    expect(existsSync(secondBackupPath!)).toBe(true);
-
-    expect(rotateSessionStorageWithBackup).toHaveBeenCalledWith({
-      sessionId: "rotate-session",
-      sessionKey: "agent:main:main",
-      sessionFile: transcriptPath,
-      lockTimeoutMs: 30_000,
-    });
-  });
-
-  it("passes command runtime context through to rotate", async () => {
-    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-runtime-context-${Date.now()}.jsonl`);
-    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
-    tempDirs.add(transcriptPath);
-
-    let currentConversationId = 0;
-    const mockedBackupPath = join(tmpdir(), `lcm-rotate-runtime-context-${Date.now()}.bak`);
-    tempDirs.add(mockedBackupPath);
-    writeFileSync(mockedBackupPath, "backup");
-    const rotateSessionStorageWithBackup = vi.fn(async () => ({
-      kind: "rotated" as const,
-      currentConversationId,
-      currentMessageCount: 1,
-      backupPath: mockedBackupPath,
-      preservedTailMessageCount: 1,
-      checkpointSize: 111,
-      bytesRemoved: 222,
-    }));
-    const deps = {
-      resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
-      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
-    } as unknown as LcmDependencies;
-    const fixture = createCommandFixture({
-      deps,
-      getLcm: async () => ({
-        rotateSessionStorageWithBackup,
-      }),
-    });
-    tempDirs.add(fixture.tempDir);
-    dbPaths.add(fixture.dbPath);
-
-    const currentConversation = await fixture.conversationStore.createConversation({
-      sessionId: "rotate-runtime-context-session",
-      sessionKey: "agent:main:main",
-    });
-    currentConversationId = currentConversation.conversationId;
-    await fixture.conversationStore.createMessagesBulk([
-      {
-        conversationId: currentConversation.conversationId,
-        seq: 0,
-        role: "user",
-        content: "first message",
-        tokenCount: 2,
-      },
-    ]);
-    const runtimeContext = {
-      provider: "openai",
-      model: "gpt-5.5",
-      config: { agents: { defaults: { model: "openai/gpt-5.5" } } },
-    };
-
-    const result = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionId: "rotate-runtime-context-session",
-        sessionKey: "agent:main:main",
-        runtimeContext,
-      }),
-    );
-
-    expect(result.text).toContain("status: rotated");
-    expect(rotateSessionStorageWithBackup).toHaveBeenCalledWith({
-      sessionId: "rotate-runtime-context-session",
-      sessionKey: "agent:main:main",
-      sessionFile: transcriptPath,
-      lockTimeoutMs: 30_000,
-      runtimeContext,
-    });
-  });
-
-  it("renders engine-reported rotate stats after waiting for other DB work", async () => {
-    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-backup-fail-${Date.now()}.jsonl`);
-    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
-    tempDirs.add(transcriptPath);
-
-    let currentConversationId = 0;
-    let mockedBackupPath = "";
-    const rotateSessionStorageWithBackup = vi.fn(async () => ({
-      kind: "rotated" as const,
-      currentConversationId,
-      currentMessageCount: 2,
-      backupPath: mockedBackupPath,
-      preservedTailMessageCount: 6,
-      checkpointSize: 1234,
-      bytesRemoved: 789,
-    }));
-    const deps = {
-      resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
-      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
-    } as unknown as LcmDependencies;
-    const fixture = createCommandFixture({
-      deps,
-      getLcm: async () => ({
-        rotateSessionStorageWithBackup,
-      }),
-    });
-    tempDirs.add(fixture.tempDir);
-    dbPaths.add(fixture.dbPath);
-
-    const currentConversation = await fixture.conversationStore.createConversation({
-      sessionId: "rotate-backup-failure-session",
-      sessionKey: "agent:main:main",
-    });
-    currentConversationId = currentConversation.conversationId;
-    mockedBackupPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
-    writeFileSync(mockedBackupPath, "backup");
-    await fixture.conversationStore.createMessagesBulk([
-      {
-        conversationId: currentConversation.conversationId,
-        seq: 0,
-        role: "user",
-        content: "first message",
-        tokenCount: 2,
-      },
-    ]);
-    const result = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionId: "rotate-backup-failure-session",
-        sessionKey: "agent:main:main",
-      }),
-    );
-
-    expect(result.text).toContain("🪓 Lossless Claw Rotate");
-    expect(result.text).toContain("messages: 2");
-    expect(result.text).toContain("status: replaced latest");
-    expect(result.text).toContain("status: rotated");
-    expect(result.text).toContain("preserved tail messages: 6");
-    expect(rotateSessionStorageWithBackup).toHaveBeenCalledWith({
-      sessionId: "rotate-backup-failure-session",
-      sessionKey: "agent:main:main",
-      sessionFile: transcriptPath,
-      lockTimeoutMs: 30_000,
-    });
-  });
-
-  it("resolves the runtime session id from the session key when rotate lacks ctx.sessionId", async () => {
-    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-runtime-session-id-${Date.now()}.jsonl`);
-    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
-    tempDirs.add(transcriptPath);
-
-    let currentConversationId = 0;
-    let mockedBackupPath = "";
-    const resolveSessionIdFromSessionKey = vi.fn(async () => "runtime-session-id");
-    const resolveSessionTranscriptFile = vi.fn(async () => transcriptPath);
-    const rotateSessionStorageWithBackup = vi.fn(async () => ({
-      kind: "rotated" as const,
-      currentConversationId,
-      currentMessageCount: 1,
-      backupPath: mockedBackupPath,
-      preservedTailMessageCount: 8,
-      checkpointSize: 1234,
-      bytesRemoved: 4567,
-    }));
-    const deps = {
-      resolveSessionIdFromSessionKey,
-      resolveSessionTranscriptFile,
-    } as unknown as LcmDependencies;
-    const fixture = createCommandFixture({
-      deps,
-      getLcm: async () => ({
-        rotateSessionStorageWithBackup,
-      }),
-    });
-    tempDirs.add(fixture.tempDir);
-    dbPaths.add(fixture.dbPath);
-
-    const currentConversation = await fixture.conversationStore.createConversation({
-      sessionId: "stored-session-id",
-      sessionKey: "agent:main:main",
-    });
-    currentConversationId = currentConversation.conversationId;
-    mockedBackupPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
-    writeFileSync(mockedBackupPath, "backup");
-    await fixture.conversationStore.createMessagesBulk([
-      {
-        conversationId: currentConversation.conversationId,
-        seq: 0,
-        role: "user",
-        content: "first message",
-        tokenCount: 2,
-      },
-    ]);
-
-    const result = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionKey: "agent:main:main",
-      }),
-    );
-
-    expect(result.text).toContain("status: rotated");
-    expect(resolveSessionIdFromSessionKey).toHaveBeenCalledWith("agent:main:main");
-    expect(resolveSessionTranscriptFile).toHaveBeenCalledWith({
-      sessionId: "runtime-session-id",
-      sessionKey: "agent:main:main",
-    });
-    expect(rotateSessionStorageWithBackup).toHaveBeenCalledWith({
-      sessionId: "runtime-session-id",
-      sessionKey: "agent:main:main",
-      sessionFile: transcriptPath,
-      lockTimeoutMs: 30_000,
-    });
-  });
-
-  it("falls back to the stored conversation session id when runtime rotate resolution is unavailable", async () => {
-    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-stored-session-id-${Date.now()}.jsonl`);
-    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
-    tempDirs.add(transcriptPath);
-
-    let currentConversationId = 0;
-    let mockedBackupPath = "";
-    const resolveSessionIdFromSessionKey = vi.fn(async () => undefined);
-    const resolveSessionTranscriptFile = vi.fn(async () => transcriptPath);
-    const rotateSessionStorageWithBackup = vi.fn(async () => ({
-      kind: "rotated" as const,
-      currentConversationId,
-      currentMessageCount: 1,
-      backupPath: mockedBackupPath,
-      preservedTailMessageCount: 8,
-      checkpointSize: 1234,
-      bytesRemoved: 4567,
-    }));
-    const deps = {
-      resolveSessionIdFromSessionKey,
-      resolveSessionTranscriptFile,
-    } as unknown as LcmDependencies;
-    const fixture = createCommandFixture({
-      deps,
-      getLcm: async () => ({
-        rotateSessionStorageWithBackup,
-      }),
-    });
-    tempDirs.add(fixture.tempDir);
-    dbPaths.add(fixture.dbPath);
-
-    const currentConversation = await fixture.conversationStore.createConversation({
-      sessionId: "stored-session-id",
-      sessionKey: "agent:main:main",
-    });
-    currentConversationId = currentConversation.conversationId;
-    mockedBackupPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
-    writeFileSync(mockedBackupPath, "backup");
-    await fixture.conversationStore.createMessagesBulk([
-      {
-        conversationId: currentConversation.conversationId,
-        seq: 0,
-        role: "user",
-        content: "first message",
-        tokenCount: 2,
-      },
-    ]);
-
-    const result = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionKey: "agent:main:main",
-      }),
-    );
-
-    expect(result.text).toContain("status: rotated");
-    expect(resolveSessionIdFromSessionKey).toHaveBeenCalledWith("agent:main:main");
-    expect(resolveSessionTranscriptFile).toHaveBeenCalledWith({
-      sessionId: "stored-session-id",
-      sessionKey: "agent:main:main",
-    });
-    expect(rotateSessionStorageWithBackup).toHaveBeenCalledWith({
-      sessionId: "stored-session-id",
-      sessionKey: "agent:main:main",
-      sessionFile: transcriptPath,
-      lockTimeoutMs: 30_000,
-    });
-  });
-
-  it("reports rotate as unavailable when no session id can be resolved for the live transcript", async () => {
-    const resolveSessionIdFromSessionKey = vi.fn(async () => undefined);
-    const resolveSessionTranscriptFile = vi.fn(async () => undefined);
-    const rotateSessionStorageWithBackup = vi.fn(async () => ({
-      kind: "rotated" as const,
-      currentConversationId: 0,
-      currentMessageCount: 0,
-      backupPath: "unused",
-      preservedTailMessageCount: 0,
-      checkpointSize: 0,
-      bytesRemoved: 0,
-    }));
-    const deps = {
-      resolveSessionIdFromSessionKey,
-      resolveSessionTranscriptFile,
-    } as unknown as LcmDependencies;
-    const fixture = createCommandFixture({
-      deps,
-      getLcm: async () => ({
-        rotateSessionStorageWithBackup,
-      }),
-    });
-    tempDirs.add(fixture.tempDir);
-    dbPaths.add(fixture.dbPath);
-
-    await fixture.conversationStore.createConversation({
-      sessionId: "",
-      sessionKey: "agent:main:main",
-    });
-
-    const result = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionKey: "agent:main:main",
-      }),
-    );
-
-    expect(result.text).toContain("🪓 Lossless Claw Rotate");
-    expect(result.text).toContain("status: unavailable");
-    expect(result.text).toContain("did not expose or resolve a runtime session id");
-    expect(resolveSessionIdFromSessionKey).toHaveBeenCalledWith("agent:main:main");
-    expect(resolveSessionTranscriptFile).not.toHaveBeenCalled();
-    expect(rotateSessionStorageWithBackup).not.toHaveBeenCalled();
-  });
-
-  it("reports rotate failure when the engine reports a backup failure", async () => {
-    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-backup-fail-${Date.now()}.jsonl`);
-    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
-    tempDirs.add(transcriptPath);
-
-    let currentConversationId = 0;
-    const rotateSessionStorageWithBackup = vi.fn(async () => ({
-      kind: "backup_failed" as const,
-      currentConversationId,
-      currentMessageCount: 1,
-      reason: "SQLITE_BUSY",
-    }));
-    const deps = {
-      resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
-      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
-    } as unknown as LcmDependencies;
-    const fixture = createCommandFixture({
-      deps,
-      getLcm: async () => ({
-        rotateSessionStorageWithBackup,
-      }),
-    });
-    tempDirs.add(fixture.tempDir);
-    dbPaths.add(fixture.dbPath);
-
-    const currentConversation = await fixture.conversationStore.createConversation({
-      sessionId: "rotate-backup-failure-session",
-      sessionKey: "agent:main:main",
-    });
-    currentConversationId = currentConversation.conversationId;
-    await fixture.conversationStore.createMessagesBulk([
-      {
-        conversationId: currentConversation.conversationId,
-        seq: 0,
-        role: "user",
-        content: "first message",
-        tokenCount: 2,
-      },
-    ]);
-
-    const result = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionId: "rotate-backup-failure-session",
-        sessionKey: "agent:main:main",
-      }),
-    );
-
-    expect(result.text).toContain("🪓 Lossless Claw Rotate");
-    expect(result.text).toContain("status: failed");
-    expect(result.text).toContain("reason: SQLITE_BUSY");
-    expect(rotateSessionStorageWithBackup).toHaveBeenCalled();
-  });
-
-  it("reports rotate failure after the engine already created a backup", async () => {
-    const transcriptPath = join(tmpdir(), `lossless-claw-rotate-engine-fail-${Date.now()}.jsonl`);
-    writeFileSync(transcriptPath, "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"existing\"}]}}\n");
-    tempDirs.add(transcriptPath);
-
-    let currentConversationId = 0;
-    let mockedBackupPath = "";
-    const rotateSessionStorageWithBackup = vi.fn(async () => ({
-      kind: "rotate_failed" as const,
-      currentConversationId,
-      currentMessageCount: 1,
-      backupPath: mockedBackupPath,
-      reason: "rotate exploded",
-    }));
-    const deps = {
-      resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
-      resolveSessionTranscriptFile: vi.fn(async () => transcriptPath),
-    } as unknown as LcmDependencies;
-    const fixture = createCommandFixture({
-      deps,
-      getLcm: async () => ({
-        rotateSessionStorageWithBackup,
-      }),
-    });
-    tempDirs.add(fixture.tempDir);
-    dbPaths.add(fixture.dbPath);
-
-    const currentConversation = await fixture.conversationStore.createConversation({
-      sessionId: "rotate-engine-failure-session",
-      sessionKey: "agent:main:main",
-    });
-    currentConversationId = currentConversation.conversationId;
-    mockedBackupPath = join(fixture.tempDir, "lcm.db.rotate-latest.bak");
-    writeFileSync(mockedBackupPath, "backup");
-    await fixture.conversationStore.createMessagesBulk([
-      {
-        conversationId: currentConversation.conversationId,
-        seq: 0,
-        role: "user",
-        content: "first message",
-        tokenCount: 2,
-      },
-    ]);
-
-    const result = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionId: "rotate-engine-failure-session",
-        sessionKey: "agent:main:main",
-      }),
-    );
-
-    expect(result.text).toContain("🪓 Lossless Claw Rotate");
-    expect(result.text).toContain("status: replaced latest");
-    expect(result.text).toContain("status: failed");
-    expect(result.text).toContain("reason: rotate exploded");
-    expect(result.text).toContain("backup path:");
-  });
-
-  it("reports rotate as unavailable when OpenClaw does not expose a session key", async () => {
-    const fixture = createCommandFixture();
-    tempDirs.add(fixture.tempDir);
-    dbPaths.add(fixture.dbPath);
-
-    const result = await fixture.command.handler(
-      createCommandContext("rotate", {
-        sessionId: "rotate-missing-session-key",
-      }),
-    );
-
-    expect(result.text).toContain("🪓 Lossless Claw Rotate");
-    expect(result.text).toContain("status: unavailable");
-    expect(result.text).toContain("OpenClaw must expose the active session key");
-  });
-
   it("prefers the active conversation when multiple rows share the same session key", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);
@@ -2735,7 +4081,7 @@ describe("lcm command", () => {
       sessionId: "shared-key-old",
       sessionKey: "agent:main:main",
     });
-    await fixture.conversationStore.archiveConversation(archived.conversationId);
+    await fixture.conversationStore.archiveConversation(archived.conversationId, "rollover-fallback");
     const active = await fixture.conversationStore.createConversation({
       sessionId: "shared-key-new",
       sessionKey: "agent:main:main",
@@ -2760,7 +4106,7 @@ describe("lcm command", () => {
       sessionId: "shared-session-id",
       sessionKey: "agent:main:archived",
     });
-    await fixture.conversationStore.archiveConversation(archived.conversationId);
+    await fixture.conversationStore.archiveConversation(archived.conversationId, "rollover-fallback");
     const active = await fixture.conversationStore.createConversation({
       sessionId: "shared-session-id",
       sessionKey: "agent:main:active",
@@ -2789,9 +4135,37 @@ describe("lcm command", () => {
     const result = await fixture.command.handler(createCommandContext("rewrite"));
     expect(result.text).toContain("⚠️ Unknown subcommand `rewrite`.");
     expect(result.text).toContain("`/lossless backup`");
-    expect(result.text).toContain("`/lossless rotate`");
+    expect(result.text).not.toContain("`/lossless rotate`");
+    expect(result.text).toContain("`/lossless doctor maintenance`");
+    expect(result.text).toContain(
+      "`/lossless doctor apply maintenance <conversation-id> confirm-inactive`",
+    );
     expect(result.text).toContain("`/lossless help`");
     expect(result.text).toContain("`/lcm` is accepted as a shorter alias.");
+  });
+
+  it("uses the visible /lossless command in subcommand argument errors", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const status = await fixture.command.handler(createCommandContext("status extra"));
+    const backup = await fixture.command.handler(createCommandContext("backup extra"));
+
+    expect(status.text).toContain("`/lossless status` does not accept extra arguments.");
+    expect(backup.text).toContain("`/lossless backup` does not accept extra arguments.");
+    expect(status.text).not.toContain("`/lcm status` does not accept extra arguments.");
+    expect(backup.text).not.toContain("`/lcm backup` does not accept extra arguments.");
+  });
+
+  it("treats rotate as an unsupported subcommand", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+
+    const result = await fixture.command.handler(createCommandContext("rotate"));
+    expect(result.text).toContain("⚠️ Unknown subcommand `rotate`.");
+    expect(result.text).not.toContain("🪓 Lossless Claw Rotate");
   });
 
   it("accepts db as a lazy function and does not invoke it for help", async () => {
@@ -2841,7 +4215,8 @@ describe("lcm command", () => {
 
   it("registers a Telegram native progress placeholder", () => {
     const config = resolveLcmConfig({}, { dbPath: "/tmp/unused.db" });
-    const command = createLcmCommand({ db: vi.fn(), config });
+    const dbProvider = vi.fn() as unknown as () => DatabaseSync;
+    const command = createLcmCommand({ db: dbProvider, config });
 
     expect(command.nativeProgressMessages).toEqual({
       telegram: "Lossless Claw is working...",
@@ -2862,6 +4237,81 @@ describe("lcm command helpers", () => {
       kind: "doctor",
       apply: true,
       applyOptions: { confirmOffline: true },
+    });
+    expect(__testing.parseLcmCommand("doctor apply offline")).toEqual({
+      kind: "doctor",
+      apply: true,
+      applyOptions: { confirmOffline: true },
+    });
+    expect(__testing.parseLcmCommand("doctor apply 42")).toEqual({
+      kind: "doctor",
+      apply: true,
+      applyOptions: { confirmOffline: false, conversationId: 42 },
+    });
+    expect(__testing.parseLcmCommand("doctor apply 42 confirm-offline")).toEqual({
+      kind: "doctor",
+      apply: true,
+      applyOptions: { confirmOffline: true, conversationId: 42 },
+    });
+    expect(__testing.parseLcmCommand("doctor apply 42 offline")).toEqual({
+      kind: "help",
+      error:
+        "`/lossless doctor apply <conversation-id>` requires explicit `confirm-offline`; other offline aliases apply only to current-conversation repair.",
+    });
+    expect(__testing.parseLcmCommand("doctor apply confirm-large 42")).toEqual({
+      kind: "help",
+      error:
+        "`/lossless doctor apply <conversation-id>` requires explicit `confirm-offline`; other offline aliases apply only to current-conversation repair.",
+    });
+    expect(__testing.parseLcmCommand("doctor apply not-a-number")).toEqual({
+      kind: "help",
+      error:
+        "`/lossless doctor apply` accepts optional `confirm-offline` for the current conversation or `<conversation-id> confirm-offline` for targeted repair.",
+    });
+    expect(__testing.parseLcmCommand("doctor apply 42 42")).toEqual({
+      kind: "help",
+      error: "`/lossless doctor apply` accepts at most one conversation id.",
+    });
+    expect(__testing.parseLcmCommand("doctor apply 9007199254740992")).toEqual({
+      kind: "help",
+      error:
+        "`/lossless doctor apply` accepts optional `confirm-offline` for the current conversation or `<conversation-id> confirm-offline` for targeted repair.",
+    });
+    expect(__testing.parseLcmCommand("doctor rollover-splits")).toEqual({
+      kind: "doctor_rollover_splits",
+      apply: false,
+    });
+    expect(__testing.parseLcmCommand("doctor anchors")).toEqual({ kind: "doctor_anchors" });
+    expect(__testing.parseLcmCommand("doctor apply rollover-splits confirm")).toEqual({
+      kind: "doctor_rollover_splits",
+      apply: true,
+      applyOptions: { confirm: true },
+    });
+    expect(__testing.parseLcmCommand("doctor maintenance")).toEqual({
+      kind: "doctor_maintenance",
+      apply: false,
+    });
+    expect(__testing.parseLcmCommand("doctor apply maintenance 42 confirm-inactive")).toEqual({
+      kind: "doctor_maintenance",
+      apply: true,
+      conversationId: 42,
+      confirmed: true,
+    });
+    expect(__testing.parseLcmCommand("doctor apply maintenance 42")).toEqual({
+      kind: "doctor_maintenance",
+      apply: true,
+      conversationId: 42,
+      confirmed: false,
+    });
+    expect(__testing.parseLcmCommand("doctor apply maintenance 42 CONFIRM-INACTIVE")).toEqual({
+      kind: "help",
+      error:
+        "`/lossless doctor apply maintenance` requires a positive conversation id followed by optional exact `confirm-inactive`.",
+    });
+    expect(__testing.parseLcmCommand("doctor apply maintenance nope confirm-inactive")).toEqual({
+      kind: "help",
+      error:
+        "`/lossless doctor apply maintenance` requires a positive conversation id followed by optional exact `confirm-inactive`.",
     });
   });
 

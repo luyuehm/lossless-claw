@@ -39,17 +39,25 @@ make sure a maintainer gets a `.changeset/*.md` file onto `main`.
 
 1. Merge releasable PRs to `main`
 2. Let the `Version Packages` workflow open or update the release PR
-3. Review the generated version bump and `CHANGELOG.md`
-4. Merge the release PR to `main`
-5. Manually trigger the `Publish Package` workflow on the merged release commit
-6. Approve the workflow if a protected GitHub Environment is configured
-7. Let the workflow:
+3. Add exactly one `<!-- release-rollback-version: X.Y.Z -->` marker to the
+   generated changelog section, where `X.Y.Z` is the current npm `latest`
+   version
+4. Run `npm install --package-lock-only` and verify `package.json`, the root
+   lockfile version, and the lockfile root package version all match
+5. Approve the bot-authored release PR's GitHub Actions runs, then wait for
+   exact-head CI and review gates to pass
+6. Review the generated version bump and `CHANGELOG.md`
+7. Merge the release PR to `main`
+8. Manually trigger the `Publish Package` workflow on the merged release commit
+9. Approve the workflow if a protected GitHub Environment is configured
+10. Let the workflow:
    - install dependencies
    - run tests
    - publish to npm
    - create tag `vX.Y.Z`
    - create the GitHub release using the matching `CHANGELOG.md` section as the primary notes
    - prepend those notes ahead of GitHub's generated contributor and compare summary
+   - dispatch `Publish to ClawHub` for the same tag with `dry_run` set to `false`
 
 ## External setup required
 
@@ -63,4 +71,90 @@ Recommended external setup:
 
 When configuring npm trusted publishing, register the GitHub workflow using the exact workflow filename in this repo: `.github/workflows/publish.yml`.
 
+The workflow requests an OIDC identity token, installs an npm CLI with trusted
+publishing support, and publishes with provenance. It intentionally does not
+inject `NODE_AUTH_TOKEN` or use the legacy `NPM_TOKEN` repository secret.
+
 The publish workflow is intentionally manual. Release issuance should stay deliberate even after trusted publishing is enabled.
+
+## ClawHub releases
+
+Publish to npm first. After the npm workflow creates the matching `vX.Y.Z` tag
+and GitHub Release, it automatically dispatches `Publish to ClawHub` from that
+tag with `release_tag` set to the same tag and `dry_run` set to `false`.
+
+The standalone `Publish to ClawHub` workflow remains available for validation
+and recovery. Select the release tag as the workflow ref, set `release_tag` to
+the same tag, and use `dry_run` to choose validation or publication.
+When recovering after the release workflow itself has changed, select the
+default branch as the workflow ref and keep `release_tag` pinned to the release
+being recovered. Preflight still resolves that tag and requires its commit to
+match npm `gitHead` before publication.
+
+The workflow refuses to publish unless the selected tag, `package.json`
+version, npm version, npm `gitHead`, and the tag's immutable commit all identify
+the same release. Real ClawHub publishes are serialized. Selecting the release
+tag for both the workflow ref and package source lets ClawHub verify that the
+trusted workflow commit matches the published package commit. Tags that predate
+this workflow cannot use OIDC trusted publishing.
+
+After identity verification, the workflow downloads the exact published npm
+tarball and passes that prebuilt artifact to ClawHub. This keeps generated
+files such as `dist/index.js` identical between npm and ClawHub even though
+`dist/` is excluded from the source tag. Pull-request dry runs build and pack
+the checkout before ClawHub validation so they exercise the same artifact
+shape as a release.
+
+ClawHub trusted publishing is configured for
+`.github/workflows/clawhub-publish.yml`; no long-lived repository token is
+required. Deleting that trusted-publisher configuration disables future
+publishes.
+
+ClawHub's `latest` tag always follows the highest semantic version for code
+plugins, including prereleases. Stable releases therefore request the custom
+`stable` tag plus `latest`, while beta releases request `beta` plus `latest`.
+ClawHub keeps `stable` on the newest stable artifact and accepts `latest` only
+when the candidate is the highest version. This is intentionally independent
+of npm, where `latest` remains the stable channel and `beta` remains the beta
+channel.
+
+## Beta releases
+
+Use a Changesets prerelease when `main` needs broader testing before a stable release:
+
+1. Run `npx changeset pre enter beta` on the reviewed release branch.
+2. Run `npm run version-packages` and refresh `package-lock.json`.
+3. Add exactly one `<!-- release-rollback-version: X.Y.Z -->` marker to the
+   generated changelog section, where `X.Y.Z` is the current stable `latest`.
+4. Review and merge the generated prerelease version and changelog.
+5. Dispatch `Publish Package` from the branch containing the exact merged commit.
+
+The publish workflow maps `X.Y.Z-beta.N` to npm's `beta` dist-tag and marks the
+GitHub Release as a prerelease. Stable `X.Y.Z` versions map to npm's `latest`
+dist-tag. Other prerelease identifiers fail closed.
+
+The workflow pins the dispatch event's immutable commit, serializes publication,
+and refuses to move a dist-tag backward. The reviewed changelog commit binds the
+exact rollback version across retries. A retry resumes only when any existing
+npm version, Git tag, and GitHub Release identities match that commit exactly.
+
+Never use a beta publication to move or repair `latest` manually.
+
+### Promote a beta line to stable
+
+After the beta is accepted for stable release:
+
+1. Run `npx changeset pre exit` on a new release branch from the beta-bearing
+   `main` commit.
+2. Run `npm run version-packages` and `npm install --package-lock-only`.
+3. Add exactly one `<!-- release-rollback-version: X.Y.Z -->` marker to the
+   stable changelog section, where `X.Y.Z` is the current npm `latest` version.
+4. Verify `package.json`, the root lockfile version, and the lockfile root
+   package version all equal the expected stable version, such as `0.14.0`.
+5. Review the stable changelog, run `npm run release:verify`, and merge the
+   stable release PR only after exact-head CI and review gates pass.
+6. Dispatch `Publish Package` from that exact merged stable commit.
+
+The stable publish moves npm's `latest` dist-tag only after the workflow proves
+the candidate is newer than the current stable version. Its release notes pin
+rollback guidance to the exact prior `latest` version.

@@ -52,6 +52,208 @@ export function estimateTokens(text: string): number {
   return Math.ceil(tokens);
 }
 
+/** Fixed token cost substituted for embedded binary/image payloads. */
+const OPAQUE_BINARY_PART_TOKEN_ESTIMATE = 1_600;
+
+/** Strings at least this long are checked for base64-style opaque data. */
+const OPAQUE_BINARY_MIN_CHARS = 4_096;
+
+const TOOL_RESULT_CHARS_PER_TOKEN = 2;
+const JSON_PAYLOAD_CHARS_PER_TOKEN = 3;
+const MESSAGE_BOUNDARY_OVERHEAD_TOKENS = 12;
+const CONTENT_BLOCK_OVERHEAD_TOKENS = 6;
+const MODEL_BOUNDARY_SAFETY_MARGIN = 1.2;
+
+/**
+ * Field names that carry binary payloads (image/document sources). Only
+ * values under these keys are eligible for fixed-cost substitution: base64
+ * or hex that appears inside ordinary text/content fields IS tokenized per
+ * character at the model boundary and must be counted in full.
+ */
+const OPAQUE_BINARY_FIELD_KEYS = new Set([
+  "data",
+  "image",
+  "imageData",
+  "image_data",
+  "base64",
+  "bytes",
+  "source",
+]);
+
+/**
+ * Heuristic for embedded binary payloads providers price per item rather
+ * than per character: data: URLs anywhere, or base64-shaped blobs under a
+ * known binary field key.
+ */
+function isLikelyOpaqueBinaryString(key: string, value: string): boolean {
+  if (value.length < OPAQUE_BINARY_MIN_CHARS) {
+    return false;
+  }
+  if (value.startsWith("data:")) {
+    return true;
+  }
+  if (!OPAQUE_BINARY_FIELD_KEYS.has(key)) {
+    return false;
+  }
+  const head = value.slice(0, 512);
+  return /^[A-Za-z0-9+/=\r\n]+$/.test(head) && /[0-9]/.test(head) && /[A-Za-z]/.test(head);
+}
+
+/**
+ * Memoized serialized estimates keyed by message object identity. assemble()
+ * re-measures candidate outputs repeatedly while packing to budget; without
+ * memoization a 400-message tool-heavy transcript costs ~O(n²) full
+ * serializations per turn. Host-side in-place truncation of a cached message
+ * leaves a stale (higher) estimate, which only errs toward safety.
+ */
+const serializedEstimateCache = new WeakMap<object, number>();
+
+/**
+ * Estimate the model-boundary token cost of a full message object by
+ * serializing its rendered structure, not just its text blocks. Top-level
+ * `__openclaw` metadata belongs to the host persistence boundary and is not
+ * rendered into the model prompt.
+ *
+ * The LLM-boundary prompt renderer serializes structured tool-call payloads
+ * (tool inputs, tool result objects, mirrored identifiers) that text-only
+ * estimators never see. On tool-heavy transcripts a text-only estimate can
+ * undercount the real prompt by 2-3x, which lets "budgeted" assembly output
+ * overflow the model. Serializing the whole message tracks the boundary
+ * estimate closely; binary payloads under image/document fields are
+ * substituted with a fixed per-part cost so images do not dominate.
+ */
+export function estimateSerializedMessageTokens(message: unknown): number {
+  const cacheable = typeof message === "object" && message !== null;
+  if (cacheable) {
+    const cached = serializedEstimateCache.get(message as object);
+    if (cached !== undefined) {
+      return cached;
+    }
+  }
+  let opaqueParts = 0;
+  let serialized = "";
+  try {
+    // Agent messages are JSON-parsed transcript/provider data, so cycles do
+    // not occur in practice; shared (DAG) references serialize in full,
+    // which is what the model boundary sees too.
+    serialized =
+      JSON.stringify(message, function (this: unknown, key, value) {
+        if (this === message && key === "__openclaw") {
+          return undefined;
+        }
+        if (typeof value === "string" && isLikelyOpaqueBinaryString(key, value)) {
+          opaqueParts += 1;
+          return "[opaque binary payload]";
+        }
+        return value;
+      }) ?? "";
+  } catch {
+    // Cyclic or otherwise non-serializable input: fall back to a shallow
+    // per-part estimate so the result is never silently near-zero.
+    serialized = "";
+    const content = (message as { content?: unknown } | null)?.content;
+    if (typeof content === "string") {
+      serialized = content;
+    } else if (Array.isArray(content)) {
+      for (const part of content) {
+        try {
+          serialized += JSON.stringify(part) ?? "";
+        } catch {
+          // skip unserializable part
+        }
+      }
+    }
+  }
+  const serializedEstimate =
+    estimateTokens(serialized) + opaqueParts * OPAQUE_BINARY_PART_TOKEN_ESTIMATE;
+  const estimate = Math.max(serializedEstimate, estimateToolResultBoundaryTokens(message));
+  if (cacheable) {
+    serializedEstimateCache.set(message as object, estimate);
+  }
+  return estimate;
+}
+
+function estimateBoundaryStringTokens(text: string, charsPerToken: number): number {
+  return Math.ceil(estimateTokens(text) * (4 / charsPerToken));
+}
+
+function estimateBoundaryJsonTokens(value: unknown, charsPerToken: number): number {
+  if (value == null) {
+    return 0;
+  }
+  try {
+    const serialized = JSON.stringify(value);
+    return typeof serialized === "string"
+      ? estimateBoundaryStringTokens(serialized, charsPerToken)
+      : 1;
+  } catch {
+    return 256;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isToolResultMessage(message: unknown): message is Record<string, unknown> {
+  if (!isRecord(message)) {
+    return false;
+  }
+  return message.role === "tool" || message.role === "toolResult" || message.type === "toolResult";
+}
+
+function estimateToolResultBlockTokens(block: unknown): number {
+  if (typeof block === "string") {
+    return estimateBoundaryStringTokens(block, TOOL_RESULT_CHARS_PER_TOKEN);
+  }
+  if (!isRecord(block)) {
+    return estimateBoundaryJsonTokens(block, TOOL_RESULT_CHARS_PER_TOKEN);
+  }
+  if (block.type === "text" && typeof block.text === "string") {
+    return (
+      CONTENT_BLOCK_OVERHEAD_TOKENS +
+      estimateBoundaryStringTokens(block.text, TOOL_RESULT_CHARS_PER_TOKEN)
+    );
+  }
+  return (
+    CONTENT_BLOCK_OVERHEAD_TOKENS +
+    estimateBoundaryJsonTokens(block, TOOL_RESULT_CHARS_PER_TOKEN)
+  );
+}
+
+function estimateToolResultContentTokens(content: unknown): number {
+  if (typeof content === "string") {
+    return estimateBoundaryStringTokens(content, TOOL_RESULT_CHARS_PER_TOKEN);
+  }
+  if (Array.isArray(content)) {
+    return content.reduce((sum, block) => sum + estimateToolResultBlockTokens(block), 0);
+  }
+  if (content !== undefined) {
+    return estimateBoundaryJsonTokens(content, TOOL_RESULT_CHARS_PER_TOKEN);
+  }
+  return 0;
+}
+
+function estimateToolResultBoundaryTokens(message: unknown): number {
+  if (!isToolResultMessage(message)) {
+    return 0;
+  }
+  const tokens =
+    MESSAGE_BOUNDARY_OVERHEAD_TOKENS +
+    estimateToolResultContentTokens(message.content) +
+    estimateBoundaryJsonTokens(message.toolName ?? message.tool_name, JSON_PAYLOAD_CHARS_PER_TOKEN);
+  return Math.ceil(tokens * MODEL_BOUNDARY_SAFETY_MARGIN);
+}
+
+/** Sum of `estimateSerializedMessageTokens` across a message list. */
+export function estimateSerializedMessagesTokens(messages: readonly unknown[]): number {
+  let total = 0;
+  for (const message of messages) {
+    total += estimateSerializedMessageTokens(message);
+  }
+  return total;
+}
+
 /**
  * Truncate text so the estimated token count stays within `maxTokens`.
  *

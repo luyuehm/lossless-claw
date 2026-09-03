@@ -5,6 +5,7 @@ import { buildExpansionToolDefinition } from "../src/expansion.js";
 
 const BASE_CONFIG: LcmConfig = {
   enabled: true,
+  hostFallbackMode: "error",
   databasePath: ":memory:",
   largeFilesDir: "/tmp/lcm-files",
   ignoreSessionPatterns: [],
@@ -36,16 +37,8 @@ const BASE_CONFIG: LcmConfig = {
   summaryTimeoutMs: 60_000,
   timezone: "UTC",
   pruneHeartbeatOk: false,
-  transcriptGcEnabled: false,
   enableSummaryThinking: true,
   proactiveThresholdCompactionMode: "deferred",
-  autoRotateSessionFiles: {
-    enabled: true,
-    createBackups: false,
-    sizeBytes: 2 * 1024 * 1024,
-    startup: "rotate",
-    runtime: "rotate",
-  },
   independentLogFile: {
     enabled: false,
     maxFileBytes: 100 * 1024 * 1024,

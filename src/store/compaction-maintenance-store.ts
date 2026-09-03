@@ -15,8 +15,15 @@ export type ConversationCompactionMaintenanceRecord = {
   currentTokenCount: number | null;
   projectedTokenCount: number | null;
   rawTokensOutsideTail: number | null;
+  contextThreshold: number | null;
+  contextThresholdSource: "global" | "override" | null;
+  contextFreshTailCount: number | null;
+  contextLeafChunkTokens: number | null;
   retryAttempts: number;
   nextAttemptAfter: Date | null;
+  resolutionReason: "operator-ignored" | null;
+  resolvedAt: Date | null;
+  maintenanceRevision: number;
   updatedAt: Date;
 };
 
@@ -33,8 +40,15 @@ type ConversationCompactionMaintenanceRow = {
   current_token_count: number | null;
   projected_token_count: number | null;
   raw_tokens_outside_tail: number | null;
+  context_threshold: number | null;
+  context_threshold_source: string | null;
+  context_fresh_tail_count: number | null;
+  context_leaf_chunk_tokens: number | null;
   retry_attempts: number;
   next_attempt_after: string | null;
+  resolution_reason: string | null;
+  resolved_at: string | null;
+  maintenance_revision: number;
   updated_at: string;
 };
 
@@ -72,11 +86,34 @@ function toMaintenanceRecord(
     currentTokenCount: row.current_token_count,
     projectedTokenCount: row.projected_token_count,
     rawTokensOutsideTail: row.raw_tokens_outside_tail,
+    contextThreshold:
+      typeof row.context_threshold === "number" && Number.isFinite(row.context_threshold)
+        ? row.context_threshold
+        : null,
+    contextThresholdSource:
+      row.context_threshold_source === "override" || row.context_threshold_source === "global"
+        ? row.context_threshold_source
+        : null,
+    contextFreshTailCount:
+      typeof row.context_fresh_tail_count === "number" &&
+      Number.isFinite(row.context_fresh_tail_count) &&
+      row.context_fresh_tail_count > 0
+        ? Math.floor(row.context_fresh_tail_count)
+        : null,
+    contextLeafChunkTokens:
+      typeof row.context_leaf_chunk_tokens === "number" &&
+      Number.isFinite(row.context_leaf_chunk_tokens) &&
+      row.context_leaf_chunk_tokens > 0
+        ? Math.floor(row.context_leaf_chunk_tokens)
+        : null,
     retryAttempts:
       typeof row.retry_attempts === "number" && Number.isFinite(row.retry_attempts)
         ? Math.max(0, Math.floor(row.retry_attempts))
         : 0,
     nextAttemptAfter: parseUtcTimestampOrNull(row.next_attempt_after),
+    resolutionReason: row.resolution_reason === "operator-ignored" ? row.resolution_reason : null,
+    resolvedAt: parseUtcTimestampOrNull(row.resolved_at),
+    maintenanceRevision: Math.max(0, Math.floor(row.maintenance_revision)),
     updatedAt: parseUtcTimestampOrNull(row.updated_at) ?? new Date(0),
   };
 }
@@ -111,6 +148,22 @@ function mergeMaintenanceRecord(
       patch.rawTokensOutsideTail !== undefined
         ? patch.rawTokensOutsideTail
         : existing?.rawTokensOutsideTail ?? null,
+    contextThreshold:
+      patch.contextThreshold !== undefined
+        ? patch.contextThreshold
+        : existing?.contextThreshold ?? null,
+    contextThresholdSource:
+      patch.contextThresholdSource !== undefined
+        ? patch.contextThresholdSource
+        : existing?.contextThresholdSource ?? null,
+    contextFreshTailCount:
+      patch.contextFreshTailCount !== undefined
+        ? patch.contextFreshTailCount
+        : existing?.contextFreshTailCount ?? null,
+    contextLeafChunkTokens:
+      patch.contextLeafChunkTokens !== undefined
+        ? patch.contextLeafChunkTokens
+        : existing?.contextLeafChunkTokens ?? null,
     retryAttempts:
       patch.retryAttempts !== undefined
         ? Math.max(0, Math.floor(patch.retryAttempts))
@@ -119,6 +172,15 @@ function mergeMaintenanceRecord(
       patch.nextAttemptAfter !== undefined
         ? patch.nextAttemptAfter
         : existing?.nextAttemptAfter ?? null,
+    resolutionReason:
+      patch.resolutionReason !== undefined
+        ? patch.resolutionReason
+        : existing?.resolutionReason ?? null,
+    resolvedAt: patch.resolvedAt !== undefined ? patch.resolvedAt : existing?.resolvedAt ?? null,
+    maintenanceRevision:
+      patch.maintenanceRevision !== undefined
+        ? Math.max(0, Math.floor(patch.maintenanceRevision))
+        : existing?.maintenanceRevision ?? 0,
     updatedAt: new Date(),
   };
 }
@@ -157,8 +219,15 @@ export class CompactionMaintenanceStore {
            current_token_count,
            projected_token_count,
            raw_tokens_outside_tail,
+           context_threshold,
+           context_threshold_source,
+           context_fresh_tail_count,
+           context_leaf_chunk_tokens,
            retry_attempts,
            next_attempt_after,
+           resolution_reason,
+           resolved_at,
+           maintenance_revision,
            updated_at
          FROM conversation_compaction_maintenance
          WHERE conversation_id = ?`,
@@ -185,10 +254,17 @@ export class CompactionMaintenanceStore {
            current_token_count,
            projected_token_count,
            raw_tokens_outside_tail,
+           context_threshold,
+           context_threshold_source,
+           context_fresh_tail_count,
+           context_leaf_chunk_tokens,
            retry_attempts,
            next_attempt_after,
+           resolution_reason,
+           resolved_at,
+           maintenance_revision,
            updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
          ON CONFLICT(conversation_id) DO UPDATE SET
            pending = excluded.pending,
            requested_at = excluded.requested_at,
@@ -201,8 +277,15 @@ export class CompactionMaintenanceStore {
            current_token_count = excluded.current_token_count,
            projected_token_count = excluded.projected_token_count,
            raw_tokens_outside_tail = excluded.raw_tokens_outside_tail,
+           context_threshold = excluded.context_threshold,
+           context_threshold_source = excluded.context_threshold_source,
+           context_fresh_tail_count = excluded.context_fresh_tail_count,
+           context_leaf_chunk_tokens = excluded.context_leaf_chunk_tokens,
            retry_attempts = excluded.retry_attempts,
            next_attempt_after = excluded.next_attempt_after,
+           resolution_reason = excluded.resolution_reason,
+           resolved_at = excluded.resolved_at,
+           maintenance_revision = conversation_compaction_maintenance.maintenance_revision + 1,
            updated_at = datetime('now')`,
       )
       .run(
@@ -218,8 +301,15 @@ export class CompactionMaintenanceStore {
         record.currentTokenCount ?? null,
         record.projectedTokenCount ?? null,
         record.rawTokensOutsideTail ?? null,
+        record.contextThreshold ?? null,
+        record.contextThresholdSource ?? null,
+        record.contextFreshTailCount ?? null,
+        record.contextLeafChunkTokens ?? null,
         record.retryAttempts,
         record.nextAttemptAfter?.toISOString() ?? null,
+        record.resolutionReason,
+        record.resolvedAt?.toISOString() ?? null,
+        record.maintenanceRevision,
       );
   }
 
@@ -232,6 +322,10 @@ export class CompactionMaintenanceStore {
     currentTokenCount?: number | null;
     projectedTokenCount?: number | null;
     rawTokensOutsideTail?: number | null;
+    contextThreshold?: number | null;
+    contextThresholdSource?: "global" | "override" | null;
+    contextFreshTailCount?: number | null;
+    contextLeafChunkTokens?: number | null;
   }): Promise<void> {
     const existing = await this.getConversationCompactionMaintenance(input.conversationId);
     await this.saveConversationCompactionMaintenance(
@@ -244,8 +338,52 @@ export class CompactionMaintenanceStore {
         currentTokenCount: input.currentTokenCount ?? existing?.currentTokenCount ?? null,
         projectedTokenCount: input.projectedTokenCount ?? existing?.projectedTokenCount ?? null,
         rawTokensOutsideTail: input.rawTokensOutsideTail ?? existing?.rawTokensOutsideTail ?? null,
+        // Unlike the token diagnostics above, the persisted threshold is NOT
+        // carried over from the previous row: a stale threshold must not
+        // outlive the debt that resolved it, so new debt without a threshold
+        // resets both columns to null.
+        contextThreshold: input.contextThreshold ?? null,
+        contextThresholdSource: input.contextThresholdSource ?? null,
+        contextFreshTailCount: input.contextFreshTailCount ?? null,
+        contextLeafChunkTokens: input.contextLeafChunkTokens ?? null,
+        resolutionReason: null,
+        resolvedAt: null,
       }),
     );
+  }
+
+  /** Administratively close pending debt only when its conversation is inactive. */
+  async closeInactiveCompactionDebt(input: {
+    conversationId: number;
+    expectedRevision: number;
+    resolvedAt?: Date;
+  }): Promise<boolean> {
+    const result = this.db
+      .prepare(
+        `UPDATE conversation_compaction_maintenance
+         SET pending = 0,
+             running = 0,
+             resolution_reason = 'operator-ignored',
+             resolved_at = ?,
+             maintenance_revision = maintenance_revision + 1,
+             updated_at = datetime('now')
+         WHERE conversation_id = ?
+           AND maintenance_revision = ?
+           AND pending = 1
+           AND running = 0
+           AND EXISTS (
+             SELECT 1
+             FROM conversations
+             WHERE conversations.conversation_id = conversation_compaction_maintenance.conversation_id
+               AND conversations.active = 0
+           )`,
+      )
+      .run(
+        (input.resolvedAt ?? new Date()).toISOString(),
+        input.conversationId,
+        input.expectedRevision,
+      );
+    return Number(result.changes) === 1;
   }
 
   /** Mark deferred proactive compaction as actively running. */

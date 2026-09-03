@@ -5,7 +5,10 @@ import type {
   RuntimeLlmModelOverride,
 } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
-import { buildDeterministicFallbackSummary } from "./summary-fallback.js";
+import {
+  buildDeterministicFallbackSummary,
+  MIN_FALLBACK_MAX_TOKENS,
+} from "./summary-fallback.js";
 export { FALLBACK_SUMMARY_MARKER } from "./summary-fallback.js";
 
 export type LcmSummarizeOptions = {
@@ -80,6 +83,11 @@ type SummaryMode = "normal" | "aggressive";
 
 const DEFAULT_LEAF_TARGET_TOKENS = 2400;
 const DEFAULT_CONDENSED_TARGET_TOKENS = 2000;
+// Extra completion budget granted when summary thinking is enabled: reasoning
+// models count chain-of-thought tokens against maxTokens, so the hard cap must
+// exceed the prompt's target length or short segments exhaust the budget on
+// reasoning and return empty content (#877).
+const SUMMARY_REASONING_HEADROOM_TOKENS = 2048;
 const LCM_SUMMARIZER_SYSTEM_PROMPT = [
   "You are a context-compaction summarization engine. Return plain text summary content only.",
   "",
@@ -1461,6 +1469,26 @@ function resolveSummaryCandidates(params: {
     }
   }
 
+  if (resolutionCandidates.every((candidate) => !candidate.modelRef)) {
+    try {
+      const resolved = params.deps.resolveModel(undefined, providerHint || undefined);
+      if (resolved.provider && resolved.model) {
+        resolvedCandidates.push({
+          levelName: "effective OpenClaw default model",
+          modelRef: "",
+          providerHint: providerHint || undefined,
+          hasExplicitProvider: false,
+          provider: resolved.provider,
+          model: resolved.model,
+        });
+      }
+    } catch (err) {
+      params.deps.log.error(
+        `[lcm] createLcmSummarize: resolveModel FAILED at effective OpenClaw default model: ${describeLogError(err)}`,
+      );
+    }
+  }
+
   return dedupeResolvedCandidates(resolvedCandidates);
 }
 
@@ -1534,6 +1562,26 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       leafTargetTokens,
       condensedTargetTokens,
     });
+    const fallbackMaxTokens =
+      typeof params.deps.config.fallbackMaxTokens === "number" &&
+      Number.isFinite(params.deps.config.fallbackMaxTokens) &&
+      params.deps.config.fallbackMaxTokens >= MIN_FALLBACK_MAX_TOKENS
+        ? Math.floor(params.deps.config.fallbackMaxTokens)
+        : undefined;
+    const buildFallbackSummary = (): string =>
+      buildDeterministicFallbackSummary(
+        text,
+        targetTokens,
+        fallbackMaxTokens !== undefined ? { maxTokens: fallbackMaxTokens } : undefined,
+      );
+    // maxTokens is the completion hard cap; summary length is governed by the
+    // prompt's "Target length" guidance (targetTokens). With summary thinking
+    // enabled, reasoning tokens also draw from this cap, so grant headroom
+    // beyond the target or reasoning models return empty content (#877).
+    const initialMaxTokens =
+      params.deps.config.enableSummaryThinking !== false
+        ? targetTokens + SUMMARY_REASONING_HEADROOM_TOKENS
+        : targetTokens;
     const prompt = isCondensed
       ? buildCondensedSummaryPrompt({
           text,
@@ -1561,9 +1609,13 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       const model = candidate.model;
       const runtimeModelOverride = buildRuntimeModelOverride(candidate);
       const nextCandidate = index < resolvedCandidates.length - 1 ? resolvedCandidates[index + 1]! : undefined;
+      const shouldRequestSummaryThinking =
+        params.deps.config.enableSummaryThinking !== false &&
+        provider.trim().toLowerCase() !== "ollama";
       const runSummarizerCall = async (
         label: string,
         reasoning?: string,
+        maxTokensOverride?: number,
       ) =>
         withTimeout(params.deps.complete({
           provider,
@@ -1579,8 +1631,8 @@ export async function createLcmSummarizeFromLegacyParams(params: {
               content: prompt,
             },
           ],
-          maxTokens: targetTokens,
-          ...(params.deps.config.enableSummaryThinking !== false
+          maxTokens: maxTokensOverride ?? initialMaxTokens,
+          ...(shouldRequestSummaryThinking
             ? ({ reasoningIfSupported: "low" } as const)
             : {}),
           ...(reasoning ? { reasoning } : {}),
@@ -1589,9 +1641,10 @@ export async function createLcmSummarizeFromLegacyParams(params: {
       const attemptSummarizerCall = async (
         label: string,
         reasoning?: string,
+        maxTokensOverride?: number,
       ): Promise<Awaited<ReturnType<typeof params.deps.complete>>> => {
         try {
-          const result = await runSummarizerCall(label, reasoning);
+          const result = await runSummarizerCall(label, reasoning, maxTokensOverride);
           const policyFailure = extractRuntimeLlmPolicyFailure(result);
           if (policyFailure) {
             throw new LcmRuntimeLlmPolicyError({
@@ -1701,7 +1754,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
           params.deps.log.warn(
             `[lcm] summarizer timed out; provider=${provider}; model=${model}; source=fallback`,
           );
-          return buildDeterministicFallbackSummary(text, targetTokens);
+          return buildFallbackSummary();
         }
         break;
       }
@@ -1798,10 +1851,16 @@ export async function createLcmSummarizeFromLegacyParams(params: {
 
         // Single retry with conservative parameters to coax a textual response
         // from providers that sometimes return reasoning-only or empty blocks.
+        // Double the first attempt's completion budget (floored at the
+        // configured target) so the retry is never a verbatim replay when the
+        // first call exhausted its budget on reasoning output (#877).
+        const retryMaxTokens = Math.max(
+          initialMaxTokens * 2,
+          isCondensed ? condensedTargetTokens : leafTargetTokens,
+        );
         try {
-          const retryReasoning =
-            params.deps.config.enableSummaryThinking !== false ? "low" : undefined;
-          const retryResult = await attemptSummarizerCall("retry", retryReasoning);
+          const retryReasoning = shouldRequestSummaryThinking ? "low" : undefined;
+          const retryResult = await attemptSummarizerCall("retry", retryReasoning, retryMaxTokens);
           const retryNormalized = normalizeCompletionSummary(retryResult.content);
           const retryEnvelopeNormalized = retryNormalized.summary
             ? retryNormalized
@@ -1921,7 +1980,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
         params.deps.log.error(
           `[lcm] all extraction attempts exhausted; provider=${provider}; model=${model}; source=fallback`,
         );
-        return buildDeterministicFallbackSummary(text, targetTokens);
+        return buildFallbackSummary();
       }
 
       if (summarySource !== "content") {
@@ -1939,7 +1998,7 @@ export async function createLcmSummarizeFromLegacyParams(params: {
     if (lastAuthError) {
       throw lastAuthError;
     }
-    return buildDeterministicFallbackSummary(text, targetTokens);
+    return buildFallbackSummary();
   };
 
   return {

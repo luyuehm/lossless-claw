@@ -4,6 +4,7 @@ import {
   resetDelegatedExpansionGrantsForTests,
 } from "../src/expansion-auth.js";
 import { formatTimestamp } from "../src/compaction.js";
+import { formatToolOutputReference } from "../src/large-files.js";
 import { createLcmDescribeTool } from "../src/tools/lcm-describe-tool.js";
 import { createLcmExpandTool } from "../src/tools/lcm-expand-tool.js";
 import { createLcmGrepTool } from "../src/tools/lcm-grep-tool.js";
@@ -50,15 +51,7 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       largeFileSummaryModel: "",
       timezone: "UTC",
       pruneHeartbeatOk: false,
-      transcriptGcEnabled: false,
       proactiveThresholdCompactionMode: "deferred",
-      autoRotateSessionFiles: {
-        enabled: true,
-        createBackups: false,
-        sizeBytes: 2 * 1024 * 1024,
-        startup: "rotate",
-        runtime: "rotate",
-      },
       summaryMaxOverageFactor: 3,
     },
     complete: vi.fn(),
@@ -70,7 +63,6 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
     buildSubagentSystemPrompt: () => "subagent prompt",
     readLatestAssistantReply: () => undefined,
     resolveAgentDir: () => "/tmp/openclaw-agent",
-    resolveSessionIdFromSessionKey: async () => undefined,
     agentLaneSubagent: "subagent",
     log: {
       info: vi.fn(),
@@ -89,8 +81,10 @@ function buildLcmEngine(params: {
     describe: ReturnType<typeof vi.fn>;
   };
   conversationId?: number;
+  conversationSessionKey?: string | null;
   conversationIdBySessionKey?: number;
   conversationFamilyIds?: number[];
+  conversationFamilyIdsByRoot?: Record<number, number[]>;
   timezone?: string;
 }) {
   return {
@@ -104,26 +98,37 @@ function buildLcmEngine(params: {
           : {
               conversationId: params.conversationId,
               sessionId: "session-1",
+              sessionKey: params.conversationSessionKey === undefined
+                ? "agent:main:main"
+                : params.conversationSessionKey,
+              active: true,
               title: null,
               bootstrappedAt: null,
               createdAt: new Date("2026-01-01T00:00:00.000Z"),
               updatedAt: new Date("2026-01-01T00:00:00.000Z"),
             },
       ),
-      getConversationBySessionKey: vi.fn(async () =>
+      getConversationBySessionKey: vi.fn(async (sessionKey: string) =>
         params.conversationIdBySessionKey == null
           ? null
           : {
               conversationId: params.conversationIdBySessionKey,
               sessionId: "legacy-session",
-              sessionKey: "agent:main:main",
+              sessionKey,
+              active: true,
               title: null,
               bootstrappedAt: null,
               createdAt: new Date("2026-01-01T00:00:00.000Z"),
               updatedAt: new Date("2026-01-01T00:00:00.000Z"),
             },
       ),
-      getConversationFamilyIds: vi.fn(async () => {
+      getConversationFamilyIds: vi.fn(async (input: { conversationId?: number }) => {
+        const idsForRoot = input.conversationId == null
+          ? undefined
+          : params.conversationFamilyIdsByRoot?.[input.conversationId];
+        if (idsForRoot) {
+          return idsForRoot;
+        }
         if (params.conversationFamilyIds && params.conversationFamilyIds.length > 0) {
           return params.conversationFamilyIds;
         }
@@ -158,6 +163,12 @@ describe("LCM tools session scoping", () => {
     expect(patternDescription).toContain("FTS5 defaults to AND matching");
     expect(patternDescription).toContain("prefer 1-3 distinctive terms or one quoted multi-word phrase");
     expect(patternDescription).toContain("Regex syntax such as alternation (`A|B`) requires regex mode");
+    const scopeDescription = (
+      tool.parameters as {
+        properties: Record<string, { description?: string }>;
+      }
+    ).properties.scope?.description;
+    expect(scopeDescription).toContain("bounded prefix of externalized large file contents");
   });
 
   it("lcm_grep rejects regex alternation in full-text mode before searching", async () => {
@@ -352,7 +363,124 @@ describe("LCM tools session scoping", () => {
     expect(text).toContain("**Mode:** full_text | **Scope:** both | **Sort:** relevance");
   });
 
-  it("lcm_grep resolves conversation scope via sessionKey continuity before sessionId lookup", async () => {
+  it("lcm_grep reports the bounded file scan contract for scope=files", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        files: [
+          {
+            fileId: "file_abc123",
+            conversationId: 42,
+            fileName: "large.log",
+            matchedText: "NEEDLE",
+            lineNumber: 12,
+            byteOffset: 345,
+            snippet: "before NEEDLE after",
+            scannedBytes: 512_000,
+            scanByteLimit: 512_000,
+            scanTruncated: true,
+            createdAt: new Date("2026-01-02T00:00:00.000Z"),
+          },
+        ],
+        totalMatches: 1,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-files", {
+      pattern: "NEEDLE",
+      scope: "files",
+      fileIds: ["file_abc123"],
+    });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: "files",
+        fileIds: ["file_abc123"],
+      }),
+    );
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("**File scan:** first 512,000 bytes per file");
+    expect(text).toContain("matches beyond that prefix are not searched");
+    expect(text).toContain("file scan truncated");
+    expect(result.details).toMatchObject({
+      fileCount: 1,
+      fileScanByteLimit: 512_000,
+    });
+  });
+
+  it("lcm_describe rejects inverted file line ranges before retrieval", async () => {
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-describe-range", {
+      id: "file_abc123",
+      expandFile: true,
+      startLine: 20,
+      endLine: 10,
+    });
+
+    expect(retrieval.describe).not.toHaveBeenCalled();
+    expect((result.details as { error?: string }).error).toContain(
+      "`endLine` must be greater than or equal to `startLine`",
+    );
+  });
+
+  it("lcm_describe extracts file_xxx from a full [LCM Tool Output: ...] reference string", async () => {
+    const retrieval = {
+      grep: vi.fn(),
+      expand: vi.fn(),
+      describe: vi.fn(async () => ({
+        id: "file_abc123",
+        type: "file" as const,
+        file: {
+          conversationId: 42,
+          fileName: "large.log",
+          mimeType: "text/plain",
+          byteSize: 1234,
+          lineCount: 56,
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        },
+      })),
+    };
+
+    const tool = createLcmDescribeTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({ retrieval, conversationId: 42 }) as never,
+      sessionId: "session-1",
+    });
+    const result = await tool.execute("call-describe-reference", {
+      id: formatToolOutputReference({
+        fileId: "file_abc123",
+        toolName: "read_file",
+        byteSize: 1234,
+        summary: "Relevant lines from the requested file.",
+      }),
+    });
+
+    expect(retrieval.describe).toHaveBeenCalledWith(
+      "file_abc123",
+      expect.any(Object),
+    );
+    expect((result.content[0] as { text: string }).text).toContain("LCM File: file_abc123");
+  });
+
+  it("lcm_grep resolves conversation scope via sessionKey continuity", async () => {
     const retrieval = {
       grep: vi.fn(async () => ({
         messages: [],
@@ -364,9 +492,7 @@ describe("LCM tools session scoping", () => {
     };
 
     const tool = createLcmGrepTool({
-      deps: makeDeps({
-        resolveSessionIdFromSessionKey: vi.fn(async () => "uuid-after-reset"),
-      }),
+      deps: makeDeps(),
       lcm: buildLcmEngine({ retrieval, conversationIdBySessionKey: 42 }) as never,
       sessionKey: "agent:main:main",
     });
@@ -378,6 +504,134 @@ describe("LCM tools session scoping", () => {
         conversationIds: [42],
       }),
     );
+  });
+
+  it("lcm_grep prefers the active runtime session when the tool sessionKey is stale", async () => {
+    const retrieval = {
+      grep: vi.fn(async (input: { conversationIds?: number[] }) => {
+        const found = input.conversationIds?.includes(1987) === true;
+        return {
+          messages: found
+            ? [{
+                messageId: 987,
+                conversationId: 1987,
+                role: "assistant",
+                snippet: "SMOKE_OK",
+                createdAt: new Date("2026-07-11T13:19:00.000Z"),
+                rank: 0,
+              }]
+            : [],
+          summaries: [],
+          totalMatches: found ? 1 : 0,
+        };
+      }),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const deps = makeDeps();
+    const tool = createLcmGrepTool({
+      deps,
+      lcm: buildLcmEngine({
+        retrieval,
+        conversationId: 1987,
+        conversationIdBySessionKey: 1884,
+        conversationFamilyIdsByRoot: {
+          1884: [1884],
+          1987: [1987, 1986],
+        },
+      }) as never,
+      sessionId: "02b94cf7-f5bd-49d2-8883-90d7a92cfc8f",
+      sessionKey: "agent:main:telegram:default:direct:stale-chat",
+    });
+    const result = await tool.execute("call-stale-key", { pattern: "SMOKE_OK" });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 1987,
+        conversationIds: [1987, 1986],
+      }),
+    );
+    expect((result.content[0] as { text: string }).text).toContain("SMOKE_OK");
+    expect(deps.log.warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "requestedSessionKey=agent:main:telegram:default:direct:stale-chat resolvedConversation=1884",
+      ),
+    );
+    expect(deps.log.warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "alternativeConversation=1987 alternativeSessionKey=agent:main:main alternativeActive=true",
+      ),
+    );
+  });
+
+  it("lcm_grep does not reuse a stale cron key when the active runtime has no sessionKey", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const tool = createLcmGrepTool({
+      deps: makeDeps(),
+      lcm: buildLcmEngine({
+        retrieval,
+        conversationId: 1987,
+        conversationSessionKey: null,
+        conversationIdBySessionKey: 1884,
+        conversationFamilyIdsByRoot: {
+          1884: [1884],
+          1987: [1987, 1986],
+        },
+      }) as never,
+      sessionId: "active-runtime-session",
+      sessionKey: "agent:main:cron:stale-run",
+    });
+    await tool.execute("call-null-runtime-key", { pattern: "SMOKE_OK" });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 1987,
+        conversationIds: [1987, 1986],
+      }),
+    );
+  });
+
+  it("lcm_grep does not warn when runtime and tool identities resolve to one conversation", async () => {
+    const retrieval = {
+      grep: vi.fn(async () => ({
+        messages: [],
+        summaries: [],
+        totalMatches: 0,
+      })),
+      expand: vi.fn(),
+      describe: vi.fn(),
+    };
+
+    const deps = makeDeps();
+    const tool = createLcmGrepTool({
+      deps,
+      lcm: buildLcmEngine({
+        retrieval,
+        conversationId: 42,
+        conversationIdBySessionKey: 42,
+      }) as never,
+      sessionId: "runtime-session-42",
+      sessionKey: "agent:main:main",
+    });
+    await tool.execute("call-same-conversation", { pattern: "deployment" });
+
+    expect(retrieval.grep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversationId: 42,
+        conversationIds: [42],
+      }),
+    );
+    expect(deps.log.warn).not.toHaveBeenCalled();
   });
 
   it("lcm_grep searches across a resolved session family", async () => {
@@ -392,9 +646,7 @@ describe("LCM tools session scoping", () => {
     };
 
     const tool = createLcmGrepTool({
-      deps: makeDeps({
-        resolveSessionIdFromSessionKey: vi.fn(async () => "uuid-after-reset"),
-      }),
+      deps: makeDeps(),
       lcm: buildLcmEngine({
         retrieval,
         conversationIdBySessionKey: 42,
@@ -526,9 +778,7 @@ describe("LCM tools session scoping", () => {
     };
 
     const tool = createLcmGrepTool({
-      deps: makeDeps({
-        resolveSessionIdFromSessionKey: vi.fn(async () => "uuid-after-reset"),
-      }),
+      deps: makeDeps(),
       lcm: buildLcmEngine({
         retrieval,
         conversationIdBySessionKey: 42,

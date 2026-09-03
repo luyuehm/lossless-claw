@@ -1,10 +1,13 @@
+import { open, realpath } from "node:fs/promises";
 import type { DatabaseSync } from "node:sqlite";
+import { resolve as resolvePath, sep as pathSep } from "node:path";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { appendConversationScopeConstraint } from "./conversation-scope.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, containsCjk, createFallbackSnippet } from "./full-text-fallback.js";
 import { parseUtcTimestamp, parseUtcTimestampOrNull } from "./parse-utc-timestamp.js";
 import { buildFtsOrderBy, type SearchSort } from "./full-text-sort.js";
+import { compileSafeSearchRegex } from "./search-regex.js";
 
 export type SummaryKind = "leaf" | "condensed";
 export type ContextItemType = "message" | "summary";
@@ -96,6 +99,7 @@ export type CreateLargeFileInput = {
   fileName?: string;
   mimeType?: string;
   byteSize?: number;
+  lineCount?: number;
   storageUri: string;
   explorationSummary?: string;
 };
@@ -106,42 +110,55 @@ export type LargeFileRecord = {
   fileName: string | null;
   mimeType: string | null;
   byteSize: number | null;
+  lineCount: number | null;
   storageUri: string;
   explorationSummary: string | null;
   createdAt: Date;
 };
 
-export type UpsertConversationBootstrapStateInput = {
-  conversationId: number;
-  sessionFilePath: string;
-  lastSeenSize: number;
-  lastSeenMtimeMs: number;
-  lastProcessedOffset: number;
-  lastProcessedEntryHash?: string | null;
-  forkBounded?: boolean;
-  forkSourceMessageCount?: number;
+export type LargeFileReadOptions = {
+  largeFilesDir: string;
+  maxBytes?: number;
 };
 
-export type ConversationBootstrapStateRecord = {
-  conversationId: number;
-  sessionFilePath: string;
-  lastSeenSize: number;
-  lastSeenMtimeMs: number;
-  lastProcessedOffset: number;
-  lastProcessedEntryHash: string | null;
-  forkBounded: boolean;
-  forkSourceMessageCount: number;
-  updatedAt: Date;
+
+export type LargeFileSearchInput = {
+  query: string;
+  mode: "regex" | "full_text";
+  conversationId?: number;
+  conversationIds?: number[];
+  fileIds?: string[];
+  since?: Date;
+  before?: Date;
+  limit?: number;
+  largeFilesDir: string;
+  maxBytesPerFile?: number;
+  /** When true and no explicit fileIds/conversationId/conversationIds are
+   *  provided, search large files across all conversations. */
+  allConversations?: boolean;
 };
 
-export type TranscriptGcCandidateRecord = {
-  messageId: number;
+export const DEFAULT_LARGE_FILE_SEARCH_MAX_BYTES = 512_000;
+
+export type LargeFileSearchResult = {
+  fileId: string;
   conversationId: number;
-  seq: number;
-  toolCallId: string;
-  toolName: string | null;
-  externalizedFileId: string | null;
-  originalByteSize: number | null;
+  fileName: string | null;
+  /** Matched text. */
+  matchedText: string;
+  /** 1-based line number where the match starts. */
+  lineNumber: number;
+  /** 0-based byte offset where the match starts. */
+  byteOffset: number;
+  /** Snippet with surrounding context. */
+  snippet: string;
+  /** Number of bytes scanned from the file for this match. */
+  scannedBytes: number;
+  /** Maximum bytes searched per file for this scan. */
+  scanByteLimit: number;
+  /** True when the file had content beyond the scanned prefix. */
+  scanTruncated: boolean;
+  createdAt: Date;
 };
 
 // ── DB row shapes (snake_case) ────────────────────────────────────────────────
@@ -222,34 +239,16 @@ interface LargeFileRow {
   file_name: string | null;
   mime_type: string | null;
   byte_size: number | null;
+  line_count: number | null;
   storage_uri: string;
   exploration_summary: string | null;
   created_at: string;
 }
 
-interface ConversationBootstrapStateRow {
-  conversation_id: number;
-  session_file_path: string;
-  last_seen_size: number;
-  last_seen_mtime_ms: number;
-  last_processed_offset: number;
-  last_processed_entry_hash: string | null;
-  fork_bounded: number;
-  fork_source_message_count: number;
-  updated_at: string;
-}
 
 const CJK_QUERY_SEGMENT_RE =
   /[\u2E80-\u9FFF\u3400-\u4DBF\uF900-\uFAFF\uAC00-\uD7AF\u3040-\u309F\u30A0-\u30FF]+/g;
 const LATIN_QUERY_TOKEN_RE = /[a-zA-Z0-9][\w./-]*/g;
-interface TranscriptGcCandidateRow {
-  message_id: number;
-  conversation_id: number;
-  seq: number;
-  tool_call_id: string | null;
-  tool_name: string | null;
-  metadata: string | null;
-}
 // ── Row mappers ───────────────────────────────────────────────────────────────
 
 function toSummaryRecord(row: SummaryRow): SummaryRecord {
@@ -321,67 +320,148 @@ function toLargeFileRecord(row: LargeFileRow): LargeFileRecord {
     fileName: row.file_name,
     mimeType: row.mime_type,
     byteSize: row.byte_size,
+    lineCount: row.line_count,
     storageUri: row.storage_uri,
     explorationSummary: row.exploration_summary,
     createdAt: parseUtcTimestamp(row.created_at),
   };
 }
 
-function toConversationBootstrapStateRecord(
-  row: ConversationBootstrapStateRow,
-): ConversationBootstrapStateRecord {
-  return {
-    conversationId: row.conversation_id,
-    sessionFilePath: row.session_file_path,
-    lastSeenSize: row.last_seen_size,
-    lastSeenMtimeMs: row.last_seen_mtime_ms,
-    lastProcessedOffset: row.last_processed_offset,
-    lastProcessedEntryHash: row.last_processed_entry_hash,
-    forkBounded: row.fork_bounded === 1,
-    forkSourceMessageCount:
-      typeof row.fork_source_message_count === "number" &&
-      Number.isFinite(row.fork_source_message_count) &&
-      row.fork_source_message_count >= 0
-        ? Math.floor(row.fork_source_message_count)
-        : 0,
-    updatedAt: parseUtcTimestamp(row.updated_at),
-  };
+
+function isTextLikeMimeType(mimeType: string | null): boolean {
+  if (mimeType == null) {
+    return true;
+  }
+  const lower = mimeType.toLowerCase();
+  if (lower.startsWith("text/")) {
+    return true;
+  }
+  if (
+    lower.includes("json") ||
+    lower.includes("javascript") ||
+    lower.includes("xml") ||
+    lower.includes("yaml") ||
+    lower.includes("yml") ||
+    lower.includes("toml")
+  ) {
+    return true;
+  }
+  return false;
 }
 
-function toTranscriptGcCandidateRecord(
-  row: TranscriptGcCandidateRow,
-): TranscriptGcCandidateRecord | null {
-  if (typeof row.tool_call_id !== "string" || row.tool_call_id.length === 0) {
-    return null;
+interface FileContentMatch {
+  index: number;
+  length: number;
+  text: string;
+}
+
+function findRegexMatches(content: string, pattern: string, maxMatches: number): FileContentMatch[] {
+  const regex = compileSafeSearchRegex(pattern, "g");
+  if (!regex) {
+    return [];
+  }
+  const matches: FileContentMatch[] = [];
+  let match;
+  while ((match = regex.exec(content)) !== null && matches.length < maxMatches) {
+    matches.push({ index: match.index, length: match[0].length, text: match[0] });
+    if (match.index === regex.lastIndex) {
+      regex.lastIndex++;
+    }
+  }
+  return matches;
+}
+
+function findFullTextMatches(content: string, query: string, maxMatches: number): FileContentMatch[] {
+  const terms = parseFullTextTerms(query);
+  if (terms.length === 0) {
+    return [];
+  }
+  const lowerContent = content.toLowerCase();
+  const lowerTerms = terms.map((t) => t.toLowerCase());
+
+  // AND semantics: every term must appear somewhere in the document.
+  for (const term of lowerTerms) {
+    if (!lowerContent.includes(term)) {
+      return [];
+    }
   }
 
-  let metadata: Record<string, unknown> | null = null;
-  try {
-    metadata =
-      typeof row.metadata === "string" && row.metadata.length > 0
-        ? (JSON.parse(row.metadata) as Record<string, unknown>)
-        : null;
-  } catch {
-    metadata = null;
+  const matches: FileContentMatch[] = [];
+  const firstTerm = lowerTerms[0]!;
+  let searchFrom = 0;
+  while (matches.length < maxMatches) {
+    const index = lowerContent.indexOf(firstTerm, searchFrom);
+    if (index === -1) {
+      break;
+    }
+    matches.push({
+      index,
+      length: terms[0].length,
+      text: content.slice(index, index + terms[0].length),
+    });
+    searchFrom = index + 1;
   }
+  return matches;
+}
 
-  if (!metadata || metadata.toolOutputExternalized !== true) {
-    return null;
+function lineNumberAt(content: string, index: number): number {
+  let line = 1;
+  for (let i = 0; i < index && i < content.length; i++) {
+    if (content[i] === "\n") {
+      line++;
+    }
   }
+  return line;
+}
 
-  return {
-    messageId: row.message_id,
-    conversationId: row.conversation_id,
-    seq: row.seq,
-    toolCallId: row.tool_call_id,
-    toolName: row.tool_name,
-    externalizedFileId:
-      typeof metadata.externalizedFileId === "string" ? metadata.externalizedFileId : null,
-    originalByteSize:
-      typeof metadata.originalByteSize === "number" && Number.isFinite(metadata.originalByteSize)
-        ? Math.max(0, Math.floor(metadata.originalByteSize))
-        : null,
-  };
+function parseFullTextTerms(query: string): string[] {
+  const terms: string[] = [];
+  let inQuote = false;
+  let current = "";
+  for (const char of query.trim()) {
+    if (char === '"') {
+      if (inQuote) {
+        if (current.length > 0) {
+          terms.push(current);
+          current = "";
+        }
+        inQuote = false;
+      } else {
+        inQuote = true;
+      }
+      continue;
+    }
+    if (char === " " && !inQuote) {
+      if (current.length > 0) {
+        terms.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+  if (current.length > 0) {
+    terms.push(current);
+  }
+  return terms;
+}
+
+function createSearchSnippet(content: string, index: number, length: number): string {
+  const context = 80;
+  const start = Math.max(0, index - context);
+  const end = Math.min(content.length, index + length + context);
+  let snippet = content.slice(start, end).replace(/\n/g, " ").trim();
+  if (start > 0) {
+    snippet = "..." + snippet;
+  }
+  if (end < content.length) {
+    snippet = snippet + "...";
+  }
+  return snippet;
+}
+
+function byteOffsetAt(content: string, index: number): number {
+  return Buffer.byteLength(content.slice(0, index), "utf8");
 }
 
 // ── SummaryStore ──────────────────────────────────────────────────────────────
@@ -661,71 +741,6 @@ export class SummaryStore {
     }
     return orderedLinks;
   }
-  /**
-   * Return summarized tool-result messages that are safe candidates for
-   * transcript GC because they are no longer present as raw context items.
-   */
-  async listTranscriptGcCandidates(
-    conversationId: number,
-    options?: { limit?: number },
-  ): Promise<TranscriptGcCandidateRecord[]> {
-    const limit =
-      typeof options?.limit === "number" && Number.isFinite(options.limit) && options.limit > 0
-        ? Math.max(1, Math.floor(options.limit))
-        : 25;
-
-    const rows = this.db
-      .prepare(
-        `SELECT
-           m.message_id,
-           m.conversation_id,
-           m.seq,
-           mp.tool_call_id,
-           mp.tool_name,
-           mp.metadata
-         FROM messages m
-         JOIN message_parts mp
-           ON mp.message_id = m.message_id
-         WHERE m.conversation_id = ?
-           AND m.role = 'tool'
-           AND mp.part_type = 'tool'
-           AND mp.tool_call_id IS NOT NULL
-           AND mp.tool_call_id != ''
-           AND EXISTS (
-             SELECT 1
-             FROM summary_messages sm
-             WHERE sm.message_id = m.message_id
-           )
-           AND NOT EXISTS (
-             SELECT 1
-             FROM context_items ci
-             WHERE ci.conversation_id = m.conversation_id
-               AND ci.item_type = 'message'
-               AND ci.message_id = m.message_id
-           )
-         ORDER BY m.seq ASC, mp.ordinal ASC`,
-      )
-      .all(conversationId) as unknown as TranscriptGcCandidateRow[];
-
-    const seenMessageIds = new Set<number>();
-    const candidates: TranscriptGcCandidateRecord[] = [];
-    for (const row of rows) {
-      if (seenMessageIds.has(row.message_id)) {
-        continue;
-      }
-      const candidate = toTranscriptGcCandidateRecord(row);
-      if (!candidate) {
-        continue;
-      }
-      seenMessageIds.add(candidate.messageId);
-      candidates.push(candidate);
-      if (candidates.length >= limit) {
-        break;
-      }
-    }
-
-    return candidates;
-  }
   async getSummaryChildren(parentSummaryId: string): Promise<SummaryRecord[]> {
     const rows = this.db
       .prepare(
@@ -982,6 +997,19 @@ export class SummaryStore {
     });
   }
 
+  async replaceContextRangesWithSummaries(input: {
+    conversationId: number;
+    replacements: Array<{
+      startOrdinal: number;
+      endOrdinal: number;
+      summaryId: string;
+    }>;
+  }): Promise<void> {
+    await this.withTransaction(() => {
+      this.replaceContextRangesWithSummariesInTransaction(input);
+    });
+  }
+
   // Update the context slice in-place while the caller already owns the txn.
   private replaceContextRangeWithSummaryInTransaction(input: {
     conversationId: number;
@@ -989,31 +1017,68 @@ export class SummaryStore {
     endOrdinal: number;
     summaryId: string;
   }): void {
-    const { conversationId, startOrdinal, endOrdinal, summaryId } = input;
+    this.replaceContextRangesWithSummariesInTransaction({
+      conversationId: input.conversationId,
+      replacements: [
+        {
+          startOrdinal: input.startOrdinal,
+          endOrdinal: input.endOrdinal,
+          summaryId: input.summaryId,
+        },
+      ],
+    });
+  }
 
-    // 1. Delete context items in the range [startOrdinal, endOrdinal]
-    this.db
-      .prepare(
-        `DELETE FROM context_items
-         WHERE conversation_id = ?
-           AND ordinal >= ?
-           AND ordinal <= ?`,
-      )
-      .run(conversationId, startOrdinal, endOrdinal);
+  private replaceContextRangesWithSummariesInTransaction(input: {
+    conversationId: number;
+    replacements: Array<{
+      startOrdinal: number;
+      endOrdinal: number;
+      summaryId: string;
+    }>;
+  }): void {
+    const { conversationId } = input;
+    const replacements = [...input.replacements].sort((a, b) => a.startOrdinal - b.startOrdinal);
+    let previousEndOrdinal = -1;
+    for (const replacement of replacements) {
+      if (replacement.startOrdinal < 0 || replacement.endOrdinal < replacement.startOrdinal) {
+        throw new Error(
+          `Invalid context replacement range ${replacement.startOrdinal}-${replacement.endOrdinal}`,
+        );
+      }
+      if (replacement.startOrdinal <= previousEndOrdinal) {
+        throw new Error("Context replacement ranges must not overlap");
+      }
+      previousEndOrdinal = replacement.endOrdinal;
+    }
 
-    // 2. Insert the replacement summary item at startOrdinal
-    this.db
-      .prepare(
-        `INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id)
-         VALUES (?, ?, 'summary', ?)`,
-      )
-      .run(conversationId, startOrdinal, summaryId);
+    // 1. Delete all covered context items.
+    const deleteStmt = this.db.prepare(
+      `DELETE FROM context_items
+       WHERE conversation_id = ?
+         AND ordinal >= ?
+         AND ordinal <= ?`,
+    );
+    for (const replacement of replacements) {
+      deleteStmt.run(conversationId, replacement.startOrdinal, replacement.endOrdinal);
+    }
+
+    // 2. Insert replacement summary items at their original start ordinals.
+    const insertStmt = this.db.prepare(
+      `INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id)
+       VALUES (?, ?, 'summary', ?)`,
+    );
+    for (const replacement of replacements) {
+      insertStmt.run(conversationId, replacement.startOrdinal, replacement.summaryId);
+    }
 
     // 3. Resequence all ordinals to maintain contiguity (no gaps).
-    //    Pre-compute ranks from a SELECT (safe snapshot), then apply
-    //    via 2-pass UPDATE loop using negative temps to avoid UNIQUE
-    //    constraint violations. The SELECT reads post-delete/insert
-    //    state and provides a consistent snapshot for resequencing.
+    this.resequenceContextItemsInTransaction(conversationId);
+  }
+
+  private resequenceContextItemsInTransaction(conversationId: number): void {
+    // Pre-compute ranks from a SELECT, then apply a 2-pass UPDATE loop using
+    // negative temps to avoid UNIQUE constraint violations.
     const items = this.db
       .prepare(
         `SELECT ordinal FROM context_items
@@ -1438,14 +1503,8 @@ export class SummaryStore {
     since?: Date,
     before?: Date,
   ): SummarySearchResult[] {
-    // Guard against ReDoS: reject patterns with nested quantifiers or excessive length
-    if (pattern.length > 500 || /(\+|\*|\?)\)(\+|\*|\?|\{\d)/.test(pattern)) {
-      return [];
-    }
-    let re: RegExp;
-    try {
-      re = new RegExp(pattern);
-    } catch {
+    const re = compileSafeSearchRegex(pattern);
+    if (!re) {
       return [];
     }
 
@@ -1507,8 +1566,8 @@ export class SummaryStore {
   async insertLargeFile(input: CreateLargeFileInput): Promise<LargeFileRecord> {
     this.db
       .prepare(
-        `INSERT INTO large_files (file_id, conversation_id, file_name, mime_type, byte_size, storage_uri, exploration_summary)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO large_files (file_id, conversation_id, file_name, mime_type, byte_size, line_count, storage_uri, exploration_summary)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.fileId,
@@ -1516,13 +1575,14 @@ export class SummaryStore {
         input.fileName ?? null,
         input.mimeType ?? null,
         input.byteSize ?? null,
+        input.lineCount ?? null,
         input.storageUri,
         input.explorationSummary ?? null,
       );
 
     const row = this.db
       .prepare(
-        `SELECT file_id, conversation_id, file_name, mime_type, byte_size, storage_uri, exploration_summary, created_at
+        `SELECT file_id, conversation_id, file_name, mime_type, byte_size, line_count, storage_uri, exploration_summary, created_at
        FROM large_files WHERE file_id = ?`,
       )
       .get(input.fileId) as unknown as LargeFileRow;
@@ -1533,7 +1593,7 @@ export class SummaryStore {
   async getLargeFile(fileId: string): Promise<LargeFileRecord | null> {
     const row = this.db
       .prepare(
-        `SELECT file_id, conversation_id, file_name, mime_type, byte_size, storage_uri, exploration_summary, created_at
+        `SELECT file_id, conversation_id, file_name, mime_type, byte_size, line_count, storage_uri, exploration_summary, created_at
        FROM large_files WHERE file_id = ?`,
       )
       .get(fileId) as unknown as LargeFileRow | undefined;
@@ -1543,87 +1603,294 @@ export class SummaryStore {
   async getLargeFilesByConversation(conversationId: number): Promise<LargeFileRecord[]> {
     const rows = this.db
       .prepare(
-        `SELECT file_id, conversation_id, file_name, mime_type, byte_size, storage_uri, exploration_summary, created_at
+        `SELECT file_id, conversation_id, file_name, mime_type, byte_size, line_count, storage_uri, exploration_summary, created_at
        FROM large_files
        WHERE conversation_id = ?
-       ORDER BY created_at`,
+       ORDER BY created_at DESC`,
       )
       .all(conversationId) as unknown as LargeFileRow[];
     return rows.map(toLargeFileRecord);
   }
 
-  // ── Bootstrap state ──────────────────────────────────────────────────────
-
-  async getConversationBootstrapState(
-    conversationId: number,
-  ): Promise<ConversationBootstrapStateRecord | null> {
-    const row = this.db
+  async getAllLargeFiles(): Promise<LargeFileRecord[]> {
+    const rows = this.db
       .prepare(
-        `SELECT conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
-                last_processed_offset, last_processed_entry_hash, fork_bounded,
-                fork_source_message_count, updated_at
-         FROM conversation_bootstrap_state
-         WHERE conversation_id = ?`,
+        `SELECT file_id, conversation_id, file_name, mime_type, byte_size, line_count, storage_uri, exploration_summary, created_at
+       FROM large_files
+       ORDER BY created_at DESC`,
       )
-      .get(conversationId) as unknown as ConversationBootstrapStateRow | undefined;
-    return row ? toConversationBootstrapStateRecord(row) : null;
+      .all() as unknown as LargeFileRow[];
+    return rows.map(toLargeFileRecord);
   }
 
-  async upsertConversationBootstrapState(
-    input: UpsertConversationBootstrapStateInput,
-  ): Promise<ConversationBootstrapStateRecord> {
-    this.db
-      .prepare(
-        `INSERT INTO conversation_bootstrap_state (
-           conversation_id,
-           session_file_path,
-           last_seen_size,
-           last_seen_mtime_ms,
-           last_processed_offset,
-           last_processed_entry_hash,
-           fork_bounded,
-           fork_source_message_count
-         )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (conversation_id) DO UPDATE SET
-           session_file_path = excluded.session_file_path,
-           last_seen_size = excluded.last_seen_size,
-           last_seen_mtime_ms = excluded.last_seen_mtime_ms,
-           last_processed_offset = excluded.last_processed_offset,
-           last_processed_entry_hash = excluded.last_processed_entry_hash,
-           fork_bounded = CASE
-             WHEN excluded.fork_bounded = 1 THEN 1
-             WHEN conversation_bootstrap_state.session_file_path != excluded.session_file_path THEN 0
-             ELSE conversation_bootstrap_state.fork_bounded
-           END,
-           fork_source_message_count = CASE
-             WHEN excluded.fork_bounded = 1 THEN excluded.fork_source_message_count
-             WHEN conversation_bootstrap_state.session_file_path != excluded.session_file_path THEN 0
-             ELSE conversation_bootstrap_state.fork_source_message_count
-           END,
-           updated_at = datetime('now')`,
-      )
-      .run(
-        input.conversationId,
-        input.sessionFilePath,
-        Math.max(0, Math.floor(input.lastSeenSize)),
-        Math.max(0, Math.floor(input.lastSeenMtimeMs)),
-        Math.max(0, Math.floor(input.lastProcessedOffset)),
-        input.lastProcessedEntryHash ?? null,
-        input.forkBounded === true ? 1 : 0,
-        Math.max(0, Math.floor(input.forkSourceMessageCount ?? 0)),
-      );
+  /**
+   * Search the contents of persisted large files using regex or simple full-text
+   * matching. Each file is read up to `maxBytesPerFile` (default 512KB) and only
+   * text-like MIME types are scanned.
+   */
+  async searchLargeFiles(input: LargeFileSearchInput): Promise<LargeFileSearchResult[]> {
+    const limit = input.limit ?? 50;
+    const requestedMaxBytes = input.maxBytesPerFile ?? DEFAULT_LARGE_FILE_SEARCH_MAX_BYTES;
+    const maxBytesPerFile = Number.isFinite(requestedMaxBytes)
+      ? Math.max(0, Math.trunc(requestedMaxBytes))
+      : DEFAULT_LARGE_FILE_SEARCH_MAX_BYTES;
+    const maxMatchesPerFile = 10;
 
+    let files: LargeFileRecord[] = [];
+    if (input.fileIds && input.fileIds.length > 0) {
+      for (const fileId of input.fileIds) {
+        const file = await this.getLargeFile(fileId);
+        if (file) {
+          files.push(file);
+        }
+      }
+    } else if (input.conversationIds && input.conversationIds.length > 0) {
+      for (const conversationId of input.conversationIds) {
+        const convFiles = await this.getLargeFilesByConversation(conversationId);
+        files.push(...convFiles);
+      }
+    } else if (input.conversationId != null) {
+      files = await this.getLargeFilesByConversation(input.conversationId);
+    } else if (input.allConversations) {
+      files = await this.getAllLargeFiles();
+    }
+
+    if (input.since) {
+      files = files.filter((f) => f.createdAt.getTime() >= input.since!.getTime());
+    }
+    if (input.before) {
+      files = files.filter((f) => f.createdAt.getTime() < input.before!.getTime());
+    }
+    if (input.conversationIds && input.conversationIds.length > 0) {
+      const conversationIds = new Set(input.conversationIds);
+      files = files.filter((f) => conversationIds.has(f.conversationId));
+    } else if (input.conversationId != null) {
+      files = files.filter((f) => f.conversationId === input.conversationId);
+    }
+
+    const results: LargeFileSearchResult[] = [];
+    for (const file of files) {
+      if (results.length >= limit) {
+        break;
+      }
+      if (!isTextLikeMimeType(file.mimeType)) {
+        continue;
+      }
+
+      const readResult = await this.readValidatedLargeFileContentUpTo(file.storageUri, {
+        largeFilesDir: input.largeFilesDir,
+        maxBytes: maxBytesPerFile,
+      });
+      if (readResult == null) {
+        continue;
+      }
+      const { content, scannedBytes, scanTruncated } = readResult;
+
+      const matches =
+        input.mode === "regex"
+          ? findRegexMatches(content, input.query, maxMatchesPerFile)
+          : findFullTextMatches(content, input.query, maxMatchesPerFile);
+
+      for (const match of matches) {
+        if (results.length >= limit) {
+          break;
+        }
+        results.push({
+          fileId: file.fileId,
+          conversationId: file.conversationId,
+          fileName: file.fileName,
+          matchedText: match.text,
+          lineNumber: lineNumberAt(content, match.index),
+          byteOffset: byteOffsetAt(content, match.index),
+          snippet: createSearchSnippet(content, match.index, match.length),
+          scannedBytes,
+          scanByteLimit: maxBytesPerFile,
+          scanTruncated,
+          createdAt: file.createdAt,
+        });
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * Return true when one externalized text payload exactly matches content.
+   */
+  async largeFileContentEquals(
+    fileId: string,
+    content: string,
+    options: LargeFileReadOptions,
+  ): Promise<boolean> {
+    return this.largeFileBufferEquals(fileId, Buffer.from(content, "utf8"), options);
+  }
+
+  /**
+   * Return true when one externalized binary/text payload exactly matches bytes.
+   */
+  async largeFileBufferEquals(
+    fileId: string,
+    content: Buffer,
+    options: LargeFileReadOptions,
+  ): Promise<boolean> {
+    const byteSize = content.byteLength;
     const row = this.db
       .prepare(
-        `SELECT conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
-                last_processed_offset, last_processed_entry_hash, fork_bounded,
-                fork_source_message_count, updated_at
-         FROM conversation_bootstrap_state
-         WHERE conversation_id = ?`,
+        `SELECT storage_uri
+       FROM large_files
+       WHERE file_id = ?
+         AND byte_size = ?
+       LIMIT 1`,
       )
-      .get(input.conversationId) as unknown as ConversationBootstrapStateRow;
+      .get(fileId, byteSize) as { storage_uri: string } | undefined;
+    if (!row) {
+      return false;
+    }
 
-    return toConversationBootstrapStateRecord(row);
+    return this.validatedLargeFileBufferEquals(row.storage_uri, content, options);
   }
+
+  /** Read a persisted large-file payload from disk, returning null when unavailable. */
+  async getLargeFileContent(
+    fileId: string,
+    options: LargeFileReadOptions,
+  ): Promise<string | null> {
+    const row = this.db
+      .prepare(
+        `SELECT storage_uri
+       FROM large_files
+       WHERE file_id = ?
+       LIMIT 1`,
+      )
+      .get(fileId) as { storage_uri: string } | undefined;
+    if (!row) {
+      return null;
+    }
+
+    return this.readValidatedLargeFileContent(row.storage_uri, options);
+  }
+
+  private async validatedLargeFileContentEquals(
+    storageUri: string,
+    expectedContent: string,
+    options: LargeFileReadOptions,
+  ): Promise<boolean> {
+    return this.validatedLargeFileBufferEquals(
+      storageUri,
+      Buffer.from(expectedContent, "utf8"),
+      options,
+    );
+  }
+
+  private async validatedLargeFileBufferEquals(
+    storageUri: string,
+    expected: Buffer,
+    options: LargeFileReadOptions,
+  ): Promise<boolean> {
+    try {
+      const file = await this.openValidatedLargeFile(storageUri, options);
+      if (!file) {
+        return false;
+      }
+      try {
+        const stats = await file.stat();
+        if (!stats.isFile() || stats.size !== expected.length) {
+          return false;
+        }
+        const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, expected.length)));
+        let offset = 0;
+        while (offset < expected.length) {
+          const length = Math.min(buffer.length, expected.length - offset);
+          const { bytesRead } = await file.read(buffer, 0, length, offset);
+          if (bytesRead !== length) {
+            return false;
+          }
+          if (!buffer.subarray(0, length).equals(expected.subarray(offset, offset + length))) {
+            return false;
+          }
+          offset += length;
+        }
+        return true;
+      } finally {
+        await file.close().catch(() => undefined);
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  private async readValidatedLargeFileContent(
+    storageUri: string,
+    options: LargeFileReadOptions,
+  ): Promise<string | null> {
+    try {
+      const file = await this.openValidatedLargeFile(storageUri, options);
+      if (!file) {
+        return null;
+      }
+      try {
+        const stats = await file.stat();
+        if (!stats.isFile() || (options.maxBytes != null && stats.size > options.maxBytes)) {
+          return null;
+        }
+        return await file.readFile({ encoding: "utf8" });
+      } finally {
+        await file.close().catch(() => undefined);
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  private async readValidatedLargeFileContentUpTo(
+    storageUri: string,
+    options: LargeFileReadOptions,
+  ): Promise<{ content: string; scannedBytes: number; scanTruncated: boolean } | null> {
+    try {
+      const file = await this.openValidatedLargeFile(storageUri, options);
+      if (!file) {
+        return null;
+      }
+      try {
+        const stats = await file.stat();
+        if (!stats.isFile()) {
+          return null;
+        }
+        const maxBytes = options.maxBytes ?? stats.size;
+        const readLimit = Math.min(maxBytes, stats.size);
+        const buffer = Buffer.alloc(readLimit);
+        let bytesRead = 0;
+        while (bytesRead < buffer.length) {
+          const result = await file.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+          if (result.bytesRead === 0) {
+            break;
+          }
+          bytesRead += result.bytesRead;
+        }
+        return {
+          content: buffer.subarray(0, bytesRead).toString("utf8"),
+          scannedBytes: bytesRead,
+          scanTruncated: bytesRead < stats.size,
+        };
+      } finally {
+        await file.close().catch(() => undefined);
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  private async openValidatedLargeFile(
+    storageUri: string,
+    options: LargeFileReadOptions,
+  ): Promise<Awaited<ReturnType<typeof open>> | null> {
+    const safeRoot = await realpath(resolvePath(options.largeFilesDir));
+    const realTarget = await realpath(resolvePath(storageUri));
+    if (realTarget !== safeRoot && !realTarget.startsWith(safeRoot + pathSep)) {
+      return null;
+    }
+    return open(realTarget, "r");
+  }
+
+
 }

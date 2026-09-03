@@ -10,8 +10,10 @@ Lossless Context Management plugin for [OpenClaw](https://github.com/openclaw/op
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Commands And Skill](#commands-and-skill)
+- [Session Migration CLI](#session-migration-cli)
 - [Documentation](#documentation)
 - [Development](#development)
+  - [Line endings](#line-endings)
 - [Security](#security)
 - [License](#license)
 
@@ -33,32 +35,84 @@ Nothing is lost. Raw messages stay in the database. Summaries link back to their
 
 ## Commands And Skill
 
-The plugin now ships a bundled `lossless-claw` skill plus a small plugin command surface for supported OpenClaw chat/native command providers:
+The package installs an agent-oriented `lcm` shell CLI and includes a bundled `lossless-claw` skill plus plugin commands for supported OpenClaw chat/native command providers.
 
-- `/lcm` shows version, enablement/selection state, DB path and size, summary counts, and summary-health status
-- `/lcm backup` creates a timestamped backup of the current LCM SQLite database
-- `/lcm rotate` rewrites the active session transcript into a compact tail-preserving form without changing the live OpenClaw session identity or current LCM conversation
-- `/lcm doctor` scans for broken or truncated summaries
-- `/lcm doctor clean` shows read-only high-confidence junk diagnostics for archived subagents, cron sessions, and NULL-key orphaned subagent runs
-- `/lcm status` shows plugin, conversation, and maintenance state including deferred compaction debt
-- `/lossless` is an alias for `/lcm` on supported native command surfaces
+The shell CLI reads `lcm.db` without modifying conversation data. Its only write command sets one validated Lossless config value in `openclaw.json`:
 
-These are plugin slash/native commands, not root shell CLI subcommands. Supported examples:
+```bash
+lcm status
+lcm conversations show --session-key 'agent:main:example'
+lcm messages tail --conversation-id 42
+lcm summaries list --conversation-id 42 --depth 0 --recency 7d
+lcm config get freshTailCount
+lcm config set freshTailCount 96
+```
 
-- `/lcm`
-- `/lcm backup`
-- `/lcm rotate`
-- `/lcm doctor`
-- `/lcm doctor clean`
+JSON is the default output. List commands use bounded keyset pagination. See [Lossless Claw CLI](docs/cli.md) for commands, filters, path precedence, output fields, config-write safety, and exit codes.
+
+The native OpenClaw command surface provides in-session operations:
+
+- `/lossless` shows version, enablement/selection state, DB path and size, summary counts, and summary-health status
+- `/lossless backup` creates a timestamped backup of the current LCM SQLite database
+- `/lossless doctor` scans for broken or truncated summaries
+- `/lossless doctor maintenance` reports active actionable compaction debt separately from inactive historical debt, grouped by reason, without writing
+- `/lossless doctor apply maintenance <conversation-id> confirm-inactive` administratively closes one eligible inactive debt row after creating a SQLite backup
+- `/lossless doctor apply` repairs broken summaries in the current conversation after the normal safety preflight
+- `/lossless doctor apply <conversation-id> confirm-offline` repairs a specific conversation after its active channel path has been paused or moved away; targeted repair is restricted to authorized OpenClaw command senders and always requires the explicit offline confirmation
+- `/lossless doctor clean` shows read-only high-confidence junk diagnostics for archived subagents and cron sessions under every configured OpenClaw agent id, plus NULL-key orphaned subagent runs
+- `/lossless status` shows plugin, conversation, and maintenance state including deferred compaction debt
+- `/lcm` is the shorter alias for `/lossless`
+
+Supported native command examples:
+
 - `/lossless`
+- `/lossless backup`
+- `/lossless doctor`
+- `/lossless doctor maintenance`
+- `/lossless doctor apply maintenance 42 confirm-inactive`
+- `/lossless doctor apply 42 confirm-offline`
+- `/lossless doctor clean`
+- `/lcm`
 
-Not currently supported as root CLI commands:
+The package does not register these OpenClaw root subcommands:
 
-- `openclaw lcm`
 - `openclaw lossless`
+- `openclaw lcm`
+- `openclaw /lossless`
 - `openclaw /lcm`
 
 The bundled skill focuses on configuration, diagnostics, architecture, and recall-tool usage. Its reference set lives under `skills/lossless-claw/references/`.
+
+Deferred compaction debt on an active conversation is actionable maintenance pressure. Debt on an archived or otherwise inactive conversation is historical: normal stable-session maintenance cannot select that conversation, so `/lossless doctor maintenance` reports it separately and shows a bounded set of recent examples. Closing historical debt requires the exact `confirm-inactive` token and a successful file-backed SQLite backup. The close records an `operator-ignored` resolution on the maintenance row only; it does not run compaction and does not delete or rewrite conversations, messages, summaries, or context items. If that conversation later receives a genuine new debt request, the prior administrative resolution is cleared and the row becomes pending again.
+
+### Programmatic control
+
+Lossless-claw also exposes an optional host-facing context-engine control contract for OpenClaw gateways that support context-engine capabilities and control dispatch. The contract is intentionally smaller than the native slash command surface:
+
+- `status` returns whether an LCM conversation is active and the current stored message count.
+- `doctor` returns a bounded, sanitized warning list for summary-health issues.
+
+Programmatic control never returns transcript text, local database paths, backup paths, credentials, provider debug, or shell output.
+
+This surface is capability-gated by the OpenClaw host. At the time of this change there is not yet a stable OpenClaw release with the required context-engine control endpoints; downstream users should treat it as unavailable unless their host advertises the matching capability, for example through the pending `openclaw/openclaw#98060` contract or an equivalent downstream gateway.
+
+## Session Migration CLI
+
+`lossless-claw-migrate-sessions` is a one-time shell CLI for backfilling OpenClaw JSONL session files into `lcm.db` after lossless-claw was disabled, missing, or installed after sessions already existed. It is not a background replay loop and it does not run summarization.
+
+Run it in dry-run mode first:
+
+```bash
+npx --package @martian-engineering/lossless-claw@latest lossless-claw-migrate-sessions --state-dir ~/.openclaw
+```
+
+Apply the import only after reviewing the dry-run output:
+
+```bash
+npx --package @martian-engineering/lossless-claw@latest lossless-claw-migrate-sessions --state-dir ~/.openclaw --apply
+```
+
+The command defaults to `${OPENCLAW_STATE_DIR:-~/.openclaw}` and `${OPENCLAW_STATE_DIR:-~/.openclaw}/lcm.db`. `--apply` creates a timestamped SQLite backup before writing when the database already exists. Use `--file <path>` or repeatable `--sessions-dir <path>` for targeted imports, `--since <iso-date>` or `--limit <n>` to narrow a batch, and `--json` for machine-readable output.
 
 ## Quick start
 
@@ -68,20 +122,36 @@ The bundled skill focuses on configuration, diagnostics, architecture, and recal
 - Node.js 22+
 - An LLM provider configured in OpenClaw (used for summarization)
 
-> **Compatibility:** `lossless-claw@0.10.0` and newer require OpenClaw `2026.5.12` or newer for OpenClaw's `api.runtime.llm.complete` summarization capability. Releases that include context-engine memory supplement support require OpenClaw `2026.5.28` or newer for `buildMemorySystemPromptAddition`. If you cannot upgrade OpenClaw yet, stay on `lossless-claw@0.9.4` and remove `0.10.x`-only config such as `sweepMaxDepth`.
+> **Compatibility:** `lossless-claw` requires OpenClaw `2026.7.2-beta.2` or newer. That beta is the first published build with the branch-safe visible transcript projection used to bootstrap SQLite-backed sessions; stable `2026.7.1` does not provide it. If you cannot use a beta or upgrade OpenClaw, stay on a `lossless-claw` release compatible with your installed OpenClaw version.
+
+On OpenClaw hosts that advertise the durable context-engine turn contract,
+LosslessClaw declares current-turn transcript fencing and commits each accepted
+turn through an atomic idempotency ledger. Older supported hosts continue to use
+the existing `afterTurn` compatibility path.
+
+> **Upgrade compatibility:** Lossless Claw 1.x accepts `transcriptGcEnabled` and `autoRotateSessionFiles` so 0.15 configs continue to load. It ignores both settings and warns at startup. Remove them after upgrading; OpenClaw owns active transcript storage and session-file rotation.
 
 ### Install the plugin
+
+Lossless Claw 1.0 stable releases use npm's `latest` channel. The `beta`
+channel remains available for prerelease testing.
 
 Use OpenClaw's plugin installer (recommended):
 
 ```bash
-openclaw plugins install @martian-engineering/lossless-claw
+openclaw plugins install @martian-engineering/lossless-claw@latest
 ```
 
 If you're running from a local OpenClaw checkout, use:
 
 ```bash
-pnpm openclaw plugins install @martian-engineering/lossless-claw
+pnpm openclaw plugins install @martian-engineering/lossless-claw@latest
+```
+
+Use exact versions only for rollback or reproducible canary testing. OpenClaw records an exact install spec such as `@martian-engineering/lossless-claw@0.12.0` as a pinned update track, so OpenClaw plugin update sync will keep that version until you move back to the stable track:
+
+```bash
+openclaw plugins update @martian-engineering/lossless-claw@latest
 ```
 
 For local plugin development, build your working copy first, then link it instead of copying files:
@@ -103,19 +173,30 @@ The install command records the plugin, enables it, and applies compatible slot 
 
 ### Configure OpenClaw
 
-In most cases, no manual JSON edits are needed after `openclaw plugins install`.
-
-If you need to set it manually, ensure the context engine slot points at lossless-claw:
+Ensure the context engine slot points at lossless-claw and explicitly allow its
+conversation prompt hook:
 
 ```json
 {
   "plugins": {
     "slots": {
       "contextEngine": "lossless-claw"
+    },
+    "entries": {
+      "lossless-claw": {
+        "hooks": {
+          "allowConversationAccess": true
+        }
+      }
     }
   }
 }
 ```
+
+OpenClaw builds that protect `before_prompt_build` as a conversation-access hook
+require this grant. Without it, the context engine still loads, but OpenClaw
+blocks Lossless's static recall-policy prompt hook and logs the missing setting.
+The grant belongs beside `config`, not inside it.
 
 Restart OpenClaw after configuration changes.
 
@@ -133,6 +214,9 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
     "entries": {
       "lossless-claw": {
         "enabled": true,
+        "hooks": {
+          "allowConversationAccess": true
+        },
         "llm": {
           "allowModelOverride": true,
           "allowedModels": ["openai/gpt-5.4-mini"]
@@ -142,15 +226,28 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
           "leafChunkTokens": 80000,
           "newSessionRetainDepth": 2,
           "contextThreshold": 0.75,
+          "contextThresholdOverrides": [
+            {
+              "name": "large-context-models",
+              "match": { "modelContextWindowMin": 900000 },
+              "contextThreshold": 0.15
+            },
+            {
+              "name": "telegram-sessions",
+              "match": { "sessionPattern": "agent:*:telegram:**" },
+              "contextThreshold": 0.3
+            }
+          ],
           "incrementalMaxDepth": 1,
           "cacheAwareCompaction": {
             "enabled": true,
             "cacheTTLSeconds": 300
           },
           "ignoreSessionPatterns": [
-            "agent:*:cron:**"
+            "agent:*:cron:**",
+            "agent:*:**:active-memory:**",
+            "agent:*:dreaming-narrative-**"
           ],
-          "transcriptGcEnabled": false,
           "proactiveThresholdCompactionMode": "deferred",
           "summaryModel": "openai/gpt-5.4-mini",
           "expansionModel": "openai/gpt-5.4-mini",
@@ -165,6 +262,8 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
   }
 }
 ```
+
+The `ignoreSessionPatterns` entries in this example are storage exclusions. Matching cron, active-memory, and OpenClaw memory-core dreaming narrative sessions do not create LCM conversation rows or store messages in LCM.
 
 `leafChunkTokens` controls how many source tokens can accumulate in a leaf compaction chunk before summarization is triggered. The default is `20000`, but quota-limited summary providers may benefit from a larger value to reduce compaction frequency. `summaryModel` and `summaryProvider` let you request a cheaper or faster compaction model through OpenClaw's `api.runtime.llm.complete` capability; OpenClaw still owns provider dispatch and auth. Explicit summary model requests require `llm.allowModelOverride` and matching `llm.allowedModels` policy entries for `lossless-claw`. `expansionModel` does the same for `lcm_expand_query` sub-agent calls (drilling into summaries to recover detail). `delegationTimeoutMs` controls how long `lcm_expand_query` waits for that delegated sub-agent to finish before returning a timeout error; it defaults to `120000` (120s). `summaryTimeoutMs` controls the per-call timeout for model-backed LCM summarization; it defaults to `60000` (60s). `summaryMaxCallsPerWindow`, `summaryCallWindowMs`, and `summarySpendBackoffMs` bound repeated non-auth summarization spend per session. When unset, the model settings still fall back to OpenClaw's configured default model/provider. See [Expansion model override requirements](#expansion-model-override-requirements) for the required `subagent` trust policy when using `expansionModel`.
 
@@ -185,7 +284,7 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_CONDENSED_MIN_FANOUT_HARD` | `2` | Relaxed fanout for forced compaction sweeps |
 | `LCM_INCREMENTAL_MAX_DEPTH` | `1` | How deep incremental compaction goes (0 = leaf only, 1 = one condensed pass, -1 = unlimited) |
 | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Max source tokens per leaf compaction chunk |
-| `LCM_LEAF_TARGET_TOKENS` | `1200` | Target token count for leaf summaries |
+| `LCM_LEAF_TARGET_TOKENS` | `2400` | Target token count for leaf summaries |
 | `LCM_CONDENSED_TARGET_TOKENS` | `2000` | Target token count for condensed summaries |
 | `LCM_MAX_EXPAND_TOKENS` | `4000` | Token cap for sub-agent expansion queries |
 | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | `25000` | File blocks above this size are intercepted and stored separately |
@@ -202,11 +301,9 @@ Add a `lossless-claw` entry under `plugins.entries` in your OpenClaw config:
 | `LCM_SUMMARY_MAX_CALLS_PER_WINDOW` | `24` | Max model-backed summarization calls per session/window before spend backoff opens |
 | `LCM_SUMMARY_SPEND_BACKOFF_MS` | `1800000` | Cooldown after the summarization spend guard opens |
 | `LCM_PRUNE_HEARTBEAT_OK` | `false` | Retroactively delete `HEARTBEAT_OK` turn cycles from LCM storage |
-| `LCM_TRANSCRIPT_GC_ENABLED` | `false` | Enable transcript rewrite GC during `maintain()` |
 | `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` | `deferred` | Choose whether proactive threshold compaction is deferred into maintenance debt or kept inline for legacy behavior |
 | `LCM_CACHE_TTL_SECONDS` | `300` | Cache TTL used by cache-aware deferred compaction when provider/runtime telemetry does not supply a more specific retention window |
 
-Transcript GC rewrites are disabled by default. Set `transcriptGcEnabled` or `LCM_TRANSCRIPT_GC_ENABLED` to turn them on explicitly.
 Deferred proactive compaction is also the default. Set `proactiveThresholdCompactionMode` or `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` to `inline` only if you need legacy foreground compaction behavior. In deferred mode, lossless-claw records one coalesced prompt-mutating debt item after the turn, leaves background `maintain()` to process only non-prompt-mutating work while Anthropic cache is still hot, and then consumes that debt pre-assembly once the cache is cold or the prompt is approaching overflow.
 
 ### Expansion model override requirements
@@ -250,7 +347,6 @@ Plugin config equivalents:
 - `ignoreSessionPatterns`
 - `statelessSessionPatterns`
 - `skipStatelessSessions`
-- `transcriptGcEnabled`
 - `newSessionRetainDepth`
 - `summaryModel`
 - `summaryProvider`
@@ -283,10 +379,11 @@ LCM_SUMMARY_MODEL=openai/gpt-5.4-mini
 LCM_EXPANSION_MODEL=openai/gpt-5.4-mini
 ```
 
-- **freshTailCount=64** protects the last 64 messages from compaction, giving the model more recent context for continuity.
+- **freshTailCount=64** protects the last 64 messages from compaction, expanding through the newest user when needed so its assistant/tool suffix cannot be separated from the active instruction.
 - **leafChunkTokens=20000** limits how large each leaf compaction chunk can grow before LCM summarizes it. Increase this when your summary provider is quota-limited and frequent leaf compactions are exhausting that quota.
 - **incrementalMaxDepth=1** runs one condensed pass after each leaf compaction by default. Set to `0` for leaf-only behavior, a larger positive integer for a deeper cap, or `-1` for unlimited cascading.
 - **contextThreshold=0.75** triggers compaction when context reaches 75% of the model's window, leaving headroom for the model's response.
+- **contextThresholdOverrides** optionally picks a different threshold for matching model ids, model context-window ranges, or session patterns. If no rule matches, LCM falls back to `contextThreshold`.
 
 ### Session exclusion patterns
 
@@ -297,12 +394,7 @@ Lossless-claw distinguishes OpenClaw's two session-reset commands:
 - `/new` keeps the active conversation row and all stored summaries, but prunes `context_items` so the next turn rebuilds context from retained summaries instead of the fresh tail.
 - `/reset` archives the active conversation row and creates a new active row for the same stable `sessionKey`, giving the next turn a clean LCM conversation while preserving prior history.
 
-For large sessions, neither command is a perfect “keep my live agent context, but stop writing into this giant active LCM row” tool:
-
-- `/new` keeps writing into the same active LCM conversation row.
-- `/reset` changes OpenClaw session flow, which is heavier than users often want when their real problem is just LCM row size.
-
-`/lcm rotate` fills that gap. Before trimming the transcript, it forces leaf-only compaction for raw context outside the preserved live tail so older transcript messages are represented by LCM summaries. It then replaces one rolling `rotate-latest` SQLite backup, rewrites the current session transcript down to the preserved live tail plus current session settings, and refreshes the bootstrap frontier on the same active LCM conversation so dropped transcript history is not replayed. Existing durable messages, summaries, context items, and conversation identity stay in place; only the transcript backing is compacted. If you want additional timestamped snapshots instead, run `/lcm backup`.
+Lossless-claw no longer rewrites active OpenClaw transcripts for GC or session rotation. SQLite-backed OpenClaw owns active transcript storage; Lossless keeps durable conversation, summary, and recall data in its own SQLite database. If you want an LCM database snapshot before maintenance, run `/lossless backup`.
 
 `newSessionRetainDepth` (or `LCM_NEW_SESSION_RETAIN_DEPTH`) controls how much summary structure survives `/new`:
 
@@ -327,8 +419,12 @@ Pattern rules:
 Examples:
 
 - `agent:*:cron:**` excludes cron sessions for any agent when you want to bypass LCM entirely
+- `agent:*:**:active-memory:**` excludes active-memory sessions under nested session-key prefixes; the `**` segment is intentionally broad because it spans colon-separated session-key segments
+- `agent:*:dreaming-narrative-**` excludes OpenClaw memory-core dreaming narrative sessions; OpenClaw builds those keys with the `dreaming-narrative-` prefix ([source](https://github.com/openclaw/openclaw/blob/b81666ca6af25c86cc099983a4358cdc5ea9ced8/extensions/memory-core/src/dreaming-narrative.ts))
 - `agent:main:subagent:**` excludes all main-agent subagent sessions
 - `agent:ops:**` excludes every session under the `ops` agent id
+
+Treat these examples as storage exclusions. Matching sessions do not create LCM conversation rows or store messages in LCM, so use them only for lanes whose history can stay outside LCM.
 
 Environment variable example:
 
@@ -475,7 +571,6 @@ src/
   expansion-auth.ts         # Delegation grants for sub-agent expansion
   expansion-policy.ts       # Depth/token policy for expansion
   large-files.ts            # File interception, storage, and exploration summaries
-  integrity.ts              # DAG integrity checks and repair utilities
   transcript-repair.ts      # Tool-use/result pairing sanitization
   types.ts                  # Core type definitions (dependency injection contracts)
   openclaw-bridge.ts        # Bridge utilities
@@ -507,6 +602,22 @@ tui/                        # Interactive terminal UI (Go)
   prompts/                  # Depth-aware prompt templates
 .goreleaser.yml             # GoReleaser config for TUI binary releases
 ```
+
+### Line endings
+
+This repository codifies LF line endings through `.gitattributes` so diffs stay
+stable across macOS, Linux, and Windows development environments.
+
+- Git should store text files with LF endings in the repository.
+- The root `* text=auto eol=lf` rule normalizes newly added text files.
+- Common source, documentation, lockfile, template, and config extensions are
+  listed explicitly so contributors and tooling see the expected policy.
+- Binary assets and SQLite/database files are marked `binary` to avoid unsafe
+  newline conversion.
+- If your editor or operating system prefers CRLF locally, keep the repository
+  rules authoritative and avoid committing CRLF-only rewrites.
+- After changing line-ending rules, prefer a focused normalization commit so
+  future functional changes remain easy to review.
 
 ## Security
 

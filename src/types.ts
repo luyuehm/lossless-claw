@@ -7,6 +7,7 @@
 
 import type { LcmConfig } from "./db/config.js";
 import type { LcmConfigDiagnostics } from "./db/config.js";
+import type { AgentMessage, CompactResult } from "./openclaw-bridge.js";
 
 /**
  * Minimal LLM completion interface needed by LCM for summarization.
@@ -75,6 +76,20 @@ export type CompleteFn = (params: {
   reasoningIfSupported?: string;
 }) => Promise<CompletionResult>;
 
+/** Optional bridge to OpenClaw's built-in runtime compaction path. */
+export type RuntimeCompactionDelegateFn = (params: {
+  sessionId: string;
+  sessionKey?: string;
+  sessionFile: string;
+  tokenBudget?: number;
+  currentTokenCount?: number;
+  compactionTarget?: "budget" | "threshold";
+  customInstructions?: string;
+  runtimeContext?: Record<string, unknown>;
+  legacyParams?: Record<string, unknown>;
+  force?: boolean;
+}) => Promise<CompactResult>;
+
 /**
  * Gateway RPC call interface.
  */
@@ -103,12 +118,24 @@ export type ParseAgentSessionKeyFn = (sessionKey: string) => {
 
 export type IsSubagentSessionKeyFn = (sessionKey: string) => boolean;
 
-export type StartupSessionFileCandidate = {
+/** Storage-neutral OpenClaw session identity for transcript reads. */
+export type SessionTranscriptReadTarget = {
   sessionId: string;
   sessionKey: string;
-  sessionFile: string;
   agentId?: string;
   storePath?: string;
+  threadId?: string | number;
+};
+
+/** Branch-safe visible message projection returned by OpenClaw's transcript runtime. */
+export type VisibleSessionTranscriptMessageEntry = {
+  entryId: string;
+  parentId: string | null;
+  seq: number;
+  message: AgentMessage;
+  role: AgentMessage["role"];
+  createdAt?: string;
+  idempotencyKey?: string;
 };
 
 /**
@@ -124,6 +151,9 @@ export interface LcmDependencies {
 
   /** LLM completion function for summarization */
   complete: CompleteFn;
+
+  /** Optional OpenClaw runtime compaction delegate for sessions LCM intentionally ignores */
+  delegateCompactionToRuntime?: RuntimeCompactionDelegateFn;
 
   /** Gateway RPC call function (for subagent spawning, session ops) */
   callGateway: CallGatewayFn;
@@ -156,17 +186,11 @@ export interface LcmDependencies {
   /** Resolve the OpenClaw agent directory */
   resolveAgentDir: () => string;
 
-  /** Resolve runtime session id from an agent session key */
-  resolveSessionIdFromSessionKey: (sessionKey: string) => Promise<string | undefined>;
 
-  /** Resolve the current transcript file path for a session identity */
-  resolveSessionTranscriptFile: (params: {
-    sessionId: string;
-    sessionKey?: string;
-  }) => Promise<string | undefined>;
-
-  /** List OpenClaw-indexed session files that startup recovery may enumerate. */
-  listStartupSessionFileCandidates?: () => Promise<StartupSessionFileCandidate[]>;
+  /** Read OpenClaw-owned visible transcript entries for SQLite-backed sessions. */
+  readVisibleSessionTranscriptMessageEntries?: (
+    target: SessionTranscriptReadTarget,
+  ) => Promise<VisibleSessionTranscriptMessageEntry[]>;
 
   /** Agent lane constant for subagents */
   agentLaneSubagent: string;

@@ -1,5 +1,6 @@
 import { homedir } from "os";
 import { join } from "path";
+import { MIN_FALLBACK_MAX_TOKENS } from "../summary-fallback.js";
 
 /**
  * Resolve the active OpenClaw state directory.
@@ -23,7 +24,6 @@ export function resolveOpenclawStateDir(env: NodeJS.ProcessEnv = process.env): s
  * plugin config and status surfaces.
  */
 export const DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO = 0.90;
-export const DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES = 2 * 1024 * 1024;
 export const DEFAULT_SUMMARY_CALL_WINDOW_MS = 10 * 60 * 1000;
 export const DEFAULT_SUMMARY_MAX_CALLS_PER_WINDOW = 24;
 export const DEFAULT_SUMMARY_SPEND_BACKOFF_MS = 30 * 60 * 1000;
@@ -45,20 +45,28 @@ export type DynamicLeafChunkTokensConfig = {
 };
 
 export type ProactiveThresholdCompactionMode = "deferred" | "inline";
-export type AutoRotateSessionFileMode = "rotate" | "warn" | "off";
-
-export type AutoRotateSessionFilesConfig = {
-  enabled: boolean;
-  createBackups: boolean;
-  sizeBytes: number;
-  startup: AutoRotateSessionFileMode;
-  runtime: AutoRotateSessionFileMode;
-};
 
 export type IndependentLogFileConfig = {
   enabled: boolean;
   file?: string;
   maxFileBytes: number;
+};
+
+export type ContextThresholdOverrideMatch = {
+  model?: string;
+  modelContextWindowMin?: number;
+  modelContextWindowMax?: number;
+  sessionPattern?: string;
+};
+
+export type ContextThresholdOverride = {
+  name?: string;
+  match: ContextThresholdOverrideMatch;
+  contextThreshold: number;
+  /** Optional override for freshTailCount when this rule matches. */
+  freshTailCount?: number;
+  /** Optional override for leafChunkTokens when this rule matches. */
+  leafChunkTokens?: number;
 };
 
 export type LcmConfigSource = "env" | "plugin-config" | "default";
@@ -72,6 +80,14 @@ export type LcmConfigDiagnostics = {
 
 export type LcmConfig = {
   enabled: boolean;
+  /**
+   * How to declare agent-run host requirements. "error" (default): require the full
+   * context-engine lifecycle and fail closed on CLI-backed hosts. "capture-only": relax the
+   * requirement to bootstrap/after-turn/maintain so CLI-backed runs (e.g. claude-cli) continue
+   * with transcript capture and recall tools but WITHOUT lossless prompt assembly; native
+   * runtimes advertise the full set and keep the full engine.
+   */
+  hostFallbackMode: "error" | "capture-only";
   databasePath: string;
   /** Directory for persisting large-file text payloads. */
   largeFilesDir: string;
@@ -82,8 +98,10 @@ export type LcmConfig = {
   /** When true, stateless session pattern matching is enforced. */
   skipStatelessSessions: boolean;
   contextThreshold: number;
+  /** Optional ordered rules that override contextThreshold for matching runtime contexts. */
+  contextThresholdOverrides?: ContextThresholdOverride[];
   freshTailCount: number;
-  /** Optional token cap for the protected fresh tail; newest message is always preserved. */
+  /** Optional token cap for the protected fresh tail; the newest user-led suffix is preserved. */
   freshTailMaxTokens?: number;
   /** When true, budget-constrained assembly may keep older items by prompt relevance instead of pure chronology. */
   promptAwareEviction: boolean;
@@ -145,20 +163,18 @@ export type LcmConfig = {
   timezone: string;
   /** When true, retroactively delete HEARTBEAT_OK turn cycles from LCM storage. */
   pruneHeartbeatOk: boolean;
-  /** When true, maintain() may rewrite transcript entries for transcript GC. */
-  transcriptGcEnabled: boolean;
   /** When true, requests low reasoning from the model for summarization calls. */
   enableSummaryThinking: boolean;
   /** Controls whether proactive threshold compaction runs inline or is deferred. */
   proactiveThresholdCompactionMode: ProactiveThresholdCompactionMode;
-  /** Automatically rotate LCM-managed session JSONL files that exceed a size ceiling. */
-  autoRotateSessionFiles: AutoRotateSessionFilesConfig;
   /** Lossless-owned JSONL log file, written in addition to the OpenClaw runtime logger. */
   independentLogFile: IndependentLogFileConfig;
   /** Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. */
   maxAssemblyTokenBudget?: number;
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
   summaryMaxOverageFactor: number;
+  /** Maximum token budget for deterministic fallback summaries when the LLM summarizer fails (default 512, minimum 64). */
+  fallbackMaxTokens?: number;
   /** Custom instructions injected into all summarization prompts. */
   customInstructions: string;
   /** Consecutive auth failures before the compaction circuit breaker trips (default 5). */
@@ -309,14 +325,6 @@ function toProactiveThresholdCompactionMode(
   return undefined;
 }
 
-function toAutoRotateSessionFileMode(value: unknown): AutoRotateSessionFileMode | undefined {
-  const normalized = toStr(value)?.toLowerCase();
-  if (normalized === "rotate" || normalized === "warn" || normalized === "off") {
-    return normalized;
-  }
-  return undefined;
-}
-
 /** Coerce a byte threshold to a positive integer. */
 function toPositiveInteger(value: number | undefined): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -331,6 +339,17 @@ function toStrictPositiveInteger(value: number | undefined): number | undefined 
     return undefined;
   }
   if (!Number.isInteger(value) || value < 1) {
+    return undefined;
+  }
+  return value;
+}
+
+/** Accept only integer config values at or above a minimum. Invalid values fall back. */
+function toIntegerAtLeast(value: number | undefined, minimum: number): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  if (!Number.isInteger(value) || value < minimum) {
     return undefined;
   }
   return value;
@@ -358,6 +377,117 @@ function toRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+function parseContextThresholdOverrideThreshold(value: unknown, path: string): number {
+  const threshold = toNumber(value);
+  if (
+    threshold === undefined ||
+    !Number.isFinite(threshold) ||
+    threshold < 0 ||
+    threshold > 1
+  ) {
+    throw new Error(`${path}.contextThreshold must be a finite number between 0 and 1`);
+  }
+  return threshold;
+}
+
+function parsePositiveIntegerMatcher(value: unknown, path: string): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const parsed = toNumber(value);
+  if (
+    parsed === undefined ||
+    !Number.isFinite(parsed) ||
+    !Number.isInteger(parsed) ||
+    parsed < 1
+  ) {
+    throw new Error(`${path} must be a positive integer`);
+  }
+  return parsed;
+}
+
+function parseNonEmptyStringMatcher(value: unknown, path: string): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const parsed = toStr(value);
+  if (parsed === undefined) {
+    throw new Error(`${path} must be a non-empty string`);
+  }
+  return parsed;
+}
+
+function toContextThresholdOverrides(value: unknown): ContextThresholdOverride[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new Error("contextThresholdOverrides must be an array");
+  }
+
+  return value.map((entry, index) => {
+    const path = `contextThresholdOverrides[${index}]`;
+    const record = toRecord(entry);
+    if (!record) {
+      throw new Error(`${path} must be an object`);
+    }
+    const matchRecord = toRecord(record.match);
+    if (!matchRecord) {
+      throw new Error(`${path}.match must be an object`);
+    }
+
+    const model = parseNonEmptyStringMatcher(matchRecord.model, `${path}.match.model`);
+    const sessionPattern = parseNonEmptyStringMatcher(
+      matchRecord.sessionPattern,
+      `${path}.match.sessionPattern`,
+    );
+    const modelContextWindowMin = parsePositiveIntegerMatcher(
+      matchRecord.modelContextWindowMin,
+      `${path}.match.modelContextWindowMin`,
+    );
+    const modelContextWindowMax = parsePositiveIntegerMatcher(
+      matchRecord.modelContextWindowMax,
+      `${path}.match.modelContextWindowMax`,
+    );
+
+    if (
+      model === undefined &&
+      sessionPattern === undefined &&
+      modelContextWindowMin === undefined &&
+      modelContextWindowMax === undefined
+    ) {
+      throw new Error(`${path}.match must include at least one matcher`);
+    }
+    if (
+      modelContextWindowMin !== undefined &&
+      modelContextWindowMax !== undefined &&
+      modelContextWindowMin > modelContextWindowMax
+    ) {
+      throw new Error(`${path}.match.modelContextWindowMin must be <= modelContextWindowMax`);
+    }
+
+    const overrideFreshTailCount = record.freshTailCount !== undefined
+      ? parsePositiveIntegerMatcher(record.freshTailCount, `${path}.freshTailCount`)
+      : undefined;
+    const overrideLeafChunkTokens = record.leafChunkTokens !== undefined
+      ? parsePositiveIntegerMatcher(record.leafChunkTokens, `${path}.leafChunkTokens`)
+      : undefined;
+
+    return {
+      ...(toStr(record.name) ? { name: toStr(record.name) } : {}),
+      match: {
+        ...(model ? { model } : {}),
+        ...(modelContextWindowMin !== undefined ? { modelContextWindowMin } : {}),
+        ...(modelContextWindowMax !== undefined ? { modelContextWindowMax } : {}),
+        ...(sessionPattern ? { sessionPattern } : {}),
+      },
+      contextThreshold: parseContextThresholdOverrideThreshold(record.contextThreshold, path),
+      ...(overrideFreshTailCount !== undefined ? { freshTailCount: overrideFreshTailCount } : {}),
+      ...(overrideLeafChunkTokens !== undefined ? { leafChunkTokens: overrideLeafChunkTokens } : {}),
+    };
+  });
 }
 
 function parseEnvStrArray(value: string | undefined): string[] | undefined {
@@ -421,15 +551,10 @@ export function resolveLcmConfigWithDiagnostics(
   const pc = pluginConfig ?? {};
   const cacheAwareCompaction = toRecord(pc.cacheAwareCompaction);
   const dynamicLeafChunkTokens = toRecord(pc.dynamicLeafChunkTokens);
-  const autoRotateSessionFiles = toRecord(pc.autoRotateSessionFiles);
   const independentLogFile = toRecord(pc.independentLogFile);
   const proactiveThresholdCompactionMode = toProactiveThresholdCompactionMode(
     env.LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE,
   ) ?? toProactiveThresholdCompactionMode(pc.proactiveThresholdCompactionMode) ?? "deferred";
-  const autoRotateSessionFileSizeBytes =
-    toPositiveInteger(parseFiniteInt(env.LCM_AUTO_ROTATE_SESSION_FILES_SIZE_BYTES))
-      ?? toPositiveInteger(toNumber(autoRotateSessionFiles?.sizeBytes))
-      ?? DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES;
   const resolvedLeafChunkTokens =
     parseFiniteInt(env.LCM_LEAF_CHUNK_TOKENS)
       ?? toNumber(pc.leafChunkTokens) ?? 20000;
@@ -538,6 +663,10 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_ENABLED !== undefined
           ? env.LCM_ENABLED !== "false"
           : toBool(pc.enabled) ?? true,
+      hostFallbackMode: (() => {
+        const raw = env.LCM_HOST_FALLBACK_MODE?.trim() || toStr(pc.hostFallbackMode) || "";
+        return raw === "capture-only" ? "capture-only" : "error";
+      })(),
       databasePath:
         env.LCM_DATABASE_PATH
         ?? toStr(pc.dbPath)
@@ -556,6 +685,7 @@ export function resolveLcmConfigWithDiagnostics(
       contextThreshold:
         parseFiniteNumber(env.LCM_CONTEXT_THRESHOLD)
           ?? toNumber(pc.contextThreshold) ?? 0.75,
+      contextThresholdOverrides: toContextThresholdOverrides(pc.contextThresholdOverrides),
       freshTailCount:
         parseFiniteInt(env.LCM_FRESH_TAIL_COUNT)
           ?? toNumber(pc.freshTailCount) ?? 64,
@@ -631,34 +761,11 @@ export function resolveLcmConfigWithDiagnostics(
         env.LCM_PRUNE_HEARTBEAT_OK !== undefined
           ? env.LCM_PRUNE_HEARTBEAT_OK === "true"
           : toBool(pc.pruneHeartbeatOk) ?? false,
-      transcriptGcEnabled:
-        env.LCM_TRANSCRIPT_GC_ENABLED !== undefined
-          ? env.LCM_TRANSCRIPT_GC_ENABLED === "true"
-          : toBool(pc.transcriptGcEnabled) ?? false,
       enableSummaryThinking:
         env.LCM_ENABLE_SUMMARY_THINKING !== undefined
           ? env.LCM_ENABLE_SUMMARY_THINKING === "true"
           : toBool(pc.enableSummaryThinking) ?? true,
       proactiveThresholdCompactionMode,
-      autoRotateSessionFiles: {
-        enabled:
-          env.LCM_AUTO_ROTATE_SESSION_FILES_ENABLED !== undefined
-            ? env.LCM_AUTO_ROTATE_SESSION_FILES_ENABLED !== "false"
-            : toBool(autoRotateSessionFiles?.enabled) ?? true,
-        createBackups:
-          env.LCM_AUTO_ROTATE_SESSION_FILES_CREATE_BACKUPS !== undefined
-            ? env.LCM_AUTO_ROTATE_SESSION_FILES_CREATE_BACKUPS === "true"
-            : toBool(autoRotateSessionFiles?.createBackups) ?? false,
-        sizeBytes: autoRotateSessionFileSizeBytes,
-        startup:
-          toAutoRotateSessionFileMode(env.LCM_AUTO_ROTATE_SESSION_FILES_STARTUP)
-            ?? toAutoRotateSessionFileMode(autoRotateSessionFiles?.startup)
-            ?? "rotate",
-        runtime:
-          toAutoRotateSessionFileMode(env.LCM_AUTO_ROTATE_SESSION_FILES_RUNTIME)
-            ?? toAutoRotateSessionFileMode(autoRotateSessionFiles?.runtime)
-            ?? "rotate",
-      },
       independentLogFile: {
         enabled:
           env.LCM_LOG_FILE_ENABLED !== undefined
@@ -676,6 +783,9 @@ export function resolveLcmConfigWithDiagnostics(
       summaryMaxOverageFactor:
         parseFiniteNumber(env.LCM_SUMMARY_MAX_OVERAGE_FACTOR)
           ?? toNumber(pc.summaryMaxOverageFactor) ?? 3,
+      fallbackMaxTokens:
+        toIntegerAtLeast(parseFiniteInt(env.LCM_FALLBACK_MAX_TOKENS), MIN_FALLBACK_MAX_TOKENS)
+          ?? toIntegerAtLeast(toNumber(pc.fallbackMaxTokens), MIN_FALLBACK_MAX_TOKENS) ?? 512,
       customInstructions:
         env.LCM_CUSTOM_INSTRUCTIONS?.trim() ?? toStr(pc.customInstructions) ?? "",
       circuitBreakerThreshold:

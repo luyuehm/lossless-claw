@@ -29,7 +29,7 @@ Bad summaries do not stay local:
 
 That is why configuration choices around compaction thresholds and summary model quality matter operationally.
 
-## What `/lcm` tells you
+## What `/lossless` tells you
 
 The MVP command surface focuses on operational facts:
 
@@ -40,9 +40,9 @@ The MVP command surface focuses on operational facts:
 - total summarized source-token coverage when available
 - broken or truncated summary presence
 
-## What `/lcm doctor` tells you
+## What `/lossless doctor` tells you
 
-The MVP doctor flow is diagnostic only.
+The `/lossless doctor` scan is diagnostic only.
 
 It looks for known summary-health markers that indicate:
 
@@ -51,14 +51,16 @@ It looks for known summary-health markers that indicate:
 
 This gives users one place to answer the question “is my summary graph healthy?” without introducing a broader mutation surface.
 
-## What `/lcm doctor clean` tells you
+`/lossless doctor apply` is the separate backup-first mutation surface for repairing detected summaries. Current-conversation repair keeps the normal large/hot safety preflight. Targeting another conversation by id requires `/lossless doctor apply <conversation-id> confirm-offline` after the target's active channel path has been isolated.
+
+## What `/lossless doctor clean` tells you
 
 The cleaners flow is also diagnostic first.
 
 It reports high-confidence junk patterns that are structurally safe to review as standalone cleanup candidates, including:
 
-- archived subagent sessions
-- cron sessions
+- archived subagent sessions under configured OpenClaw agent ids
+- cron sessions under configured OpenClaw agent ids
 - NULL-key orphaned subagent context conversations
 
-This keeps cleanup discovery separate from summary-health diagnostics while still using the same native command surface.
+The keyed-session predicates compare exact colon-delimited agent and lane prefixes, so an agent id cannot consume another session-key segment. This keeps cleanup discovery separate from summary-health diagnostics while still using the same native command surface.

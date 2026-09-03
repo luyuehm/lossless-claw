@@ -44,6 +44,94 @@ func TestResolveSummaryProviderModel(t *testing.T) {
 	}
 }
 
+func TestResolveSummaryProviderModelMiniMax(t *testing.T) {
+	provider, model := resolveSummaryProviderModel("", miniMaxModel)
+	if provider != miniMaxProviderID {
+		t.Fatalf("expected provider %q, got %q", miniMaxProviderID, provider)
+	}
+	if model != miniMaxModel {
+		t.Fatalf("expected model %q, got %q", miniMaxModel, model)
+	}
+
+	provider, model = resolveSummaryProviderModel(miniMaxCNProviderID, "")
+	if provider != miniMaxCNProviderID || model != miniMaxModel {
+		t.Fatalf("expected %s/%s, got %s/%s", miniMaxCNProviderID, miniMaxModel, provider, model)
+	}
+}
+
+func TestResolveProviderAPIKeyMiniMaxEnv(t *testing.T) {
+	t.Setenv("MINIMAX_API_KEY", "test-minimax-key-123456")
+
+	key, err := resolveProviderAPIKey(appDataPaths{}, miniMaxProviderID)
+	if err != nil {
+		t.Fatalf("resolveProviderAPIKey returned error: %v", err)
+	}
+	if key != "test-minimax-key-123456" {
+		t.Fatalf("unexpected API key: %q", key)
+	}
+}
+
+func TestSummarizeMiniMaxRegionalEndpoints(t *testing.T) {
+	tests := []struct {
+		provider string
+		baseURL  string
+	}{
+		{provider: miniMaxProviderID, baseURL: defaultMiniMaxBaseURL},
+		{provider: miniMaxCNProviderID, baseURL: defaultMiniMaxCNBaseURL},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.provider, func(t *testing.T) {
+			client := &anthropicClient{
+				provider: tt.provider,
+				apiKey:   "test-minimax-key-123456",
+				model:    miniMaxModel,
+				http: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					expectedURL := tt.baseURL + "/v1/messages"
+					if req.URL.String() != expectedURL {
+						t.Fatalf("expected URL %s, got %s", expectedURL, req.URL.String())
+					}
+					if got := req.Header.Get("Authorization"); got != "Bearer test-minimax-key-123456" {
+						t.Fatalf("unexpected authorization header: %q", got)
+					}
+					if got := req.Header.Get("anthropic-version"); got != anthropicVersion {
+						t.Fatalf("unexpected API version header: %q", got)
+					}
+
+					var payload anthropicRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("decode request: %v", err)
+					}
+					if payload.Model != miniMaxModel || payload.MaxTokens != 200 {
+						t.Fatalf("unexpected request model/token budget: %#v", payload)
+					}
+					if payload.Temperature == nil || *payload.Temperature != 0 {
+						t.Fatalf("expected deterministic temperature 0, got %#v", payload.Temperature)
+					}
+					if len(payload.Messages) != 1 || payload.Messages[0].Role != "user" || payload.Messages[0].Content != "prompt" {
+						t.Fatalf("unexpected request messages: %#v", payload.Messages)
+					}
+
+					return jsonResponse(200, `{
+						"content":[
+							{"type":"thinking","thinking":"internal reasoning"},
+							{"type":"text","text":"MiniMax summary."}
+						]
+					}`), nil
+				})},
+			}
+
+			summary, err := client.summarize(context.Background(), "prompt", 200)
+			if err != nil {
+				t.Fatalf("summarize returned error: %v", err)
+			}
+			if summary != "MiniMax summary." {
+				t.Fatalf("unexpected summary: %q", summary)
+			}
+		})
+	}
+}
+
 func TestExtractOpenAISummaryFromOutputAndReasoningBlocks(t *testing.T) {
 	body := []byte(`{
 		"id":"resp_1",
@@ -228,7 +316,7 @@ func TestSummarizeAnthropicOAuthDelegatesToCLI(t *testing.T) {
 	}
 }
 
-func TestSummarizeAnthropicOAuthRejectsOversizeCLIOutput(t *testing.T) {
+func TestSummarizeAnthropicOAuthCapsOversizeCLIOutput(t *testing.T) {
 	stubClaudeCLI(t)
 	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
 	t.Setenv("LCM_HELPER_STDOUT", strings.Repeat("word ", 200))
@@ -242,12 +330,15 @@ func TestSummarizeAnthropicOAuthRejectsOversizeCLIOutput(t *testing.T) {
 		http:     &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) { return nil, nil })},
 	}
 
-	_, err := client.summarize(context.Background(), "oversized", 32)
-	if err == nil {
-		t.Fatal("expected summarize to reject oversized CLI output")
+	summary, err := client.summarize(context.Background(), "oversized", 32)
+	if err != nil {
+		t.Fatalf("summarize returned error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "exceeded target token budget") {
-		t.Fatalf("unexpected error: %v", err)
+	if estimateTokenCount(summary) > 32+cliOutputTokenSlack {
+		t.Fatalf("expected capped summary within slack limit, got %d tokens", estimateTokenCount(summary))
+	}
+	if !strings.Contains(summary, "[Capped") {
+		t.Fatalf("expected capped marker, got %q", summary)
 	}
 }
 
@@ -510,6 +601,13 @@ func TestSummarizeAnthropicRegularKeyHitsDirectAPI(t *testing.T) {
 			capturedURL = req.URL.String()
 			if got := req.Header.Get("x-api-key"); got != "sk-ant-api03-regular-key" {
 				t.Fatalf("expected x-api-key header, got %q", got)
+			}
+			var payload anthropicRequest
+			if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			if payload.Temperature == nil || *payload.Temperature != 0 {
+				t.Fatalf("expected deterministic temperature 0, got %#v", payload.Temperature)
 			}
 			return jsonResponse(200, `{
 				"content":[{"type":"text","text":"Direct API response."}]

@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -23,6 +24,60 @@ function createTestDb(fileName: string) {
   tempDirs.push(tempDir);
   const dbPath = join(tempDir, fileName);
   return getLcmConnection(dbPath);
+}
+
+function legacyRawMessageIdentityHash(role: string, content: string): string {
+  return createHash("sha256")
+    .update(role)
+    .update("\u0000")
+    .update(content)
+    .digest("hex");
+}
+
+function openClawInboundMetadataContent(params: {
+  messageId: string;
+  senderName: string;
+  text: string;
+  historyCount?: number;
+}): string {
+  return [
+    "Conversation info (untrusted metadata):",
+    "```json",
+    JSON.stringify({
+      chat_id: "telegram:chat-1",
+      message_id: params.messageId,
+      timestamp: "2026-06-16T00:00:00.000Z",
+      history_count: params.historyCount,
+    }),
+    "```",
+    "",
+    "Sender (untrusted metadata):",
+    "```json",
+    JSON.stringify({ name: params.senderName }),
+    "```",
+    "",
+    params.text,
+  ].join("\n");
+}
+
+function legacyCanonicalOpenClawIdentityContentWithRecap(params: {
+  senderName: string;
+  trailingContent: string;
+  historyCount: number;
+}): string {
+  return [
+    "Conversation info (untrusted metadata):",
+    "```json",
+    JSON.stringify({ chat_id: "telegram:chat-1", history_count: params.historyCount }),
+    "```",
+    "",
+    "Sender (untrusted metadata):",
+    "```json",
+    JSON.stringify({ name: params.senderName }),
+    "```",
+    "",
+    params.trailingContent,
+  ].join("\n");
 }
 
 /**
@@ -104,7 +159,7 @@ function seedLegacySummaryGraph(db: ReturnType<typeof getLcmConnection>): void {
 }
 
 describe("runLcmMigrations summary depth backfill", () => {
-  it("adds deferred compaction retry columns to legacy maintenance rows", () => {
+  it("adds deferred compaction retry and resolution columns without rewriting legacy maintenance rows", () => {
     const db = createTestDb("legacy-maintenance.db");
     db.exec(`
       CREATE TABLE conversations (
@@ -129,9 +184,10 @@ describe("runLcmMigrations summary depth backfill", () => {
         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
     `);
-    db.prepare(`INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)`).run(
+    db.prepare(`INSERT INTO conversations (conversation_id, session_id, title) VALUES (?, ?, ?)`).run(
       1,
       "legacy-maintenance-session",
+      "valuable legacy conversation",
     );
     db.prepare(
       `INSERT INTO conversation_compaction_maintenance (
@@ -140,16 +196,20 @@ describe("runLcmMigrations summary depth backfill", () => {
          requested_at,
          reason,
          running,
+         last_started_at,
+         last_finished_at,
          last_failure_summary,
          token_budget,
          current_token_count
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       1,
       1,
       "2026-05-31T12:00:00.000Z",
       "threshold",
       0,
+      "2026-05-31T12:01:00.000Z",
+      "2026-05-31T12:02:00.000Z",
       "provider timeout",
       4096,
       3500,
@@ -164,28 +224,65 @@ describe("runLcmMigrations summary depth backfill", () => {
     expect(columns.some((column) => column.name === "raw_tokens_outside_tail")).toBe(true);
     expect(columns.some((column) => column.name === "retry_attempts")).toBe(true);
     expect(columns.some((column) => column.name === "next_attempt_after")).toBe(true);
+    expect(columns.some((column) => column.name === "context_threshold")).toBe(true);
+    expect(columns.some((column) => column.name === "context_threshold_source")).toBe(true);
+    expect(columns.some((column) => column.name === "context_fresh_tail_count")).toBe(true);
+    expect(columns.some((column) => column.name === "context_leaf_chunk_tokens")).toBe(true);
+    expect(columns.some((column) => column.name === "resolution_reason")).toBe(true);
+    expect(columns.some((column) => column.name === "resolved_at")).toBe(true);
+    expect(columns.some((column) => column.name === "maintenance_revision")).toBe(true);
 
     const row = db
       .prepare(
-        `SELECT pending, reason, token_budget, current_token_count, retry_attempts, next_attempt_after
+        `SELECT pending, requested_at, reason, running, last_started_at, last_finished_at, last_failure_summary, token_budget, current_token_count, retry_attempts, next_attempt_after, context_threshold, context_threshold_source, context_fresh_tail_count, context_leaf_chunk_tokens, resolution_reason, resolved_at, maintenance_revision
          FROM conversation_compaction_maintenance
          WHERE conversation_id = 1`,
       )
       .get() as {
       pending: number;
+      requested_at: string;
       reason: string;
+      running: number;
+      last_started_at: string;
+      last_finished_at: string;
+      last_failure_summary: string;
       token_budget: number;
       current_token_count: number;
       retry_attempts: number;
       next_attempt_after: string | null;
+      context_threshold: number | null;
+      context_threshold_source: string | null;
+      context_fresh_tail_count: number | null;
+      context_leaf_chunk_tokens: number | null;
+      resolution_reason: string | null;
+      resolved_at: string | null;
+      maintenance_revision: number;
     };
     expect(row).toEqual({
       pending: 1,
+      requested_at: "2026-05-31T12:00:00.000Z",
       reason: "threshold",
+      running: 0,
+      last_started_at: "2026-05-31T12:01:00.000Z",
+      last_finished_at: "2026-05-31T12:02:00.000Z",
+      last_failure_summary: "provider timeout",
       token_budget: 4096,
       current_token_count: 3500,
       retry_attempts: 0,
       next_attempt_after: null,
+      context_threshold: null,
+      context_threshold_source: null,
+      context_fresh_tail_count: null,
+      context_leaf_chunk_tokens: null,
+      resolution_reason: null,
+      resolved_at: null,
+      maintenance_revision: 0,
+    });
+    expect(
+      db.prepare(`SELECT session_id, title FROM conversations WHERE conversation_id = 1`).get(),
+    ).toEqual({
+      session_id: "legacy-maintenance-session",
+      title: "valuable legacy conversation",
     });
   });
 
@@ -309,6 +406,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       { step_name: "backfillSummaryDepths", algorithm_version: 1 },
       { step_name: "backfillSummaryMetadata", algorithm_version: 1 },
       { step_name: "backfillToolCallColumns", algorithm_version: 1 },
+      { step_name: "repairOpenClawMetadataIdentityState", algorithm_version: 2 },
     ]);
 
     const depthRows = db
@@ -487,6 +585,45 @@ describe("runLcmMigrations summary depth backfill", () => {
     ).toThrow();
   });
 
+  it("adds a nullable archive_cause column to legacy conversations idempotently", () => {
+    const db = createTestDb("archive-cause.db");
+
+    db.exec(`
+      CREATE TABLE conversations (
+        conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        session_key TEXT,
+        active INTEGER NOT NULL DEFAULT 1,
+        archived_at TEXT,
+        title TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+    db.prepare(`INSERT INTO conversations (session_id, session_key) VALUES (?, ?)`).run(
+      "legacy-session",
+      "agent:test:main:legacy",
+    );
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const columns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{ name: string }>;
+    expect(columns.some((column) => column.name === "archive_cause")).toBe(true);
+
+    const legacyRow = db
+      .prepare(`SELECT archive_cause FROM conversations WHERE session_key = ?`)
+      .get("agent:test:main:legacy") as { archive_cause: string | null };
+    expect(legacyRow.archive_cause).toBeNull();
+
+    // Second run is a no-op: re-adding the column would throw "duplicate column name".
+    expect(() => runLcmMigrations(db, { fts5Available: false })).not.toThrow();
+
+    const archiveCauseColumns = (
+      db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{ name: string }>
+    ).filter((column) => column.name === "archive_cause");
+    expect(archiveCauseColumns).toHaveLength(1);
+  });
+
   it("creates focus brief tables and indexes outside the summary DAG", () => {
     const db = createTestDb("focus-briefs.db");
 
@@ -644,6 +781,137 @@ describe("runLcmMigrations summary depth backfill", () => {
       .prepare(`SELECT identity_hash FROM messages WHERE conversation_id = ? AND seq = ?`)
       .get(1, 1_204) as { identity_hash: string | null };
     expect(sampledRow.identity_hash).toBe(buildMessageIdentityHash("assistant", "batch message 1204"));
+  });
+
+  it("repairs legacy OpenClaw metadata identity hashes", () => {
+    const db = createTestDb("openclaw-metadata-identity-repair.db");
+    const rawMetadataContent = openClawInboundMetadataContent({
+      messageId: "telegram-legacy",
+      senderName: "Syu",
+      text: "please keep this context",
+    });
+
+    db.exec(`
+      CREATE TABLE conversations (
+        conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        title TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE messages (
+        message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+        content TEXT NOT NULL,
+        token_count INTEGER NOT NULL,
+        identity_hash TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (conversation_id, seq)
+      );
+    `);
+    db.prepare(`INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)`).run(
+      1,
+      "legacy-openclaw-metadata-session",
+    );
+    db.prepare(
+      `INSERT INTO messages (
+         message_id, conversation_id, seq, role, content, token_count, identity_hash
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      1,
+      1,
+      1,
+      "user",
+      rawMetadataContent,
+      1,
+      legacyRawMessageIdentityHash("user", rawMetadataContent),
+    );
+    runLcmMigrations(db, { fts5Available: false });
+
+    const messageRow = db
+      .prepare(`SELECT identity_hash FROM messages WHERE message_id = ?`)
+      .get(1) as { identity_hash: string | null };
+
+    expect(messageRow.identity_hash).toBe(buildMessageIdentityHash("user", rawMetadataContent));
+  });
+
+  it("repairs version-1 OpenClaw identity state after recap canonicalization changes", () => {
+    const db = createTestDb("openclaw-recap-identity-repair.db");
+    const recap = [
+      "Chat history since last reply (untrusted, for context):",
+      "#1001 Mon 2026-07-06 15:05:54 GMT+3 Sam Rivera: previous message",
+    ].join("\n");
+    const trailingContent = `${recap}\n\nplease keep this context`;
+    const rawMetadataContent = openClawInboundMetadataContent({
+      messageId: "telegram-recap",
+      senderName: "Syu",
+      text: trailingContent,
+      historyCount: 2,
+    });
+    const versionOneCanonicalContent = legacyCanonicalOpenClawIdentityContentWithRecap({
+      senderName: "Syu",
+      trailingContent,
+      historyCount: 2,
+    });
+
+    db.exec(`
+      CREATE TABLE conversations (
+        conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        title TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE messages (
+        message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+        content TEXT NOT NULL,
+        token_count INTEGER NOT NULL,
+        identity_hash TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (conversation_id, seq)
+      );
+
+      CREATE TABLE lcm_migration_state (
+        step_name TEXT NOT NULL,
+        algorithm_version INTEGER NOT NULL,
+        completed_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (step_name, algorithm_version)
+      );
+    `);
+    db.prepare(`INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)`).run(
+      1,
+      "version-one-openclaw-recap-session",
+    );
+    db.prepare(
+      `INSERT INTO messages (
+         message_id, conversation_id, seq, role, content, token_count, identity_hash
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      1,
+      1,
+      1,
+      "user",
+      rawMetadataContent,
+      1,
+      legacyRawMessageIdentityHash("user", versionOneCanonicalContent),
+    );
+    db.prepare(
+      `INSERT INTO lcm_migration_state (step_name, algorithm_version) VALUES (?, ?)`,
+    ).run("repairOpenClawMetadataIdentityState", 1);
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const messageRow = db
+      .prepare(`SELECT identity_hash FROM messages WHERE message_id = ?`)
+      .get(1) as { identity_hash: string | null };
+    expect(messageRow.identity_hash).toBe(buildMessageIdentityHash("user", rawMetadataContent));
   });
 
   it("skips FTS tables when fts5 is unavailable", () => {
@@ -910,30 +1178,6 @@ describe("runLcmMigrations summary depth backfill", () => {
       },
     ]);
   });
-  it("creates conversation bootstrap state storage", () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-migration-"));
-    tempDirs.push(tempDir);
-    const dbPath = join(tempDir, "bootstrap-state.db");
-    const db = getLcmConnection(dbPath);
-
-    runLcmMigrations(db, { fts5Available: false });
-
-    const columns = db.prepare(`PRAGMA table_info(conversation_bootstrap_state)`).all() as Array<{
-      name?: string;
-    }>;
-
-    expect(columns.map((column) => column.name)).toEqual([
-      "conversation_id",
-      "session_file_path",
-      "last_seen_size",
-      "last_seen_mtime_ms",
-      "last_processed_offset",
-      "last_processed_entry_hash",
-      "fork_bounded",
-      "fork_source_message_count",
-      "updated_at",
-    ]);
-  });
 
   it("creates message_parts when the bulk schema create did not", () => {
     const db = createTestDb("missing-message-parts.db");
@@ -1019,6 +1263,78 @@ describe("runLcmMigrations summary depth backfill", () => {
       .prepare(`SELECT text_content FROM message_parts WHERE part_id = ?`)
       .get("part-1") as { text_content?: string } | undefined;
     expect(partRow?.text_content).toBe("hello");
+  });
+
+  it("creates transcript anchor trust and epoch tables without trusting legacy ids", () => {
+    const db = createTestDb("transcript-anchor-trust.db");
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    db.prepare(
+      `INSERT INTO conversations (conversation_id, session_id, session_key)
+       VALUES (?, ?, ?)`,
+    ).run(1, "session-a", "agent:main:session-a");
+    db.prepare(
+      `INSERT INTO messages (
+         message_id, conversation_id, seq, role, content, token_count, transcript_entry_id
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(1, 1, 1, "assistant", "", 0, "entry-looks-authoritative");
+
+    runLcmMigrations(db, { fts5Available: false });
+
+    const tableRows = db
+      .prepare(
+        `SELECT name
+         FROM sqlite_master
+         WHERE type = 'table'
+           AND name IN ('message_transcript_anchor_trust', 'conversation_transcript_epochs')
+         ORDER BY name`,
+      )
+      .all() as Array<{ name: string }>;
+    expect(tableRows.map((row) => row.name)).toEqual([
+      "conversation_transcript_epochs",
+      "message_transcript_anchor_trust",
+    ]);
+
+    const trustColumns = db
+      .prepare(`PRAGMA table_info(message_transcript_anchor_trust)`)
+      .all() as Array<{ name?: string }>;
+    expect(trustColumns.map((column) => column.name)).toEqual([
+      "message_id",
+      "conversation_id",
+      "transcript_entry_id",
+      "trust_state",
+      "source",
+      "reason",
+      "verified_at",
+      "created_at",
+      "updated_at",
+    ]);
+
+    const epochColumns = db
+      .prepare(`PRAGMA table_info(conversation_transcript_epochs)`)
+      .all() as Array<{ name?: string }>;
+    expect(epochColumns.map((column) => column.name)).toEqual([
+      "conversation_id",
+      "session_id",
+      "session_key",
+      "frontier_entry_id",
+      "frontier_seq",
+      "frontier_created_at",
+      "migration_mode",
+      "metadata_json",
+      "created_at",
+      "updated_at",
+    ]);
+
+    const trustedRows = db
+      .prepare(`SELECT COUNT(*) AS count FROM message_transcript_anchor_trust`)
+      .get() as { count: number };
+    const epochRows = db
+      .prepare(`SELECT COUNT(*) AS count FROM conversation_transcript_epochs`)
+      .get() as { count: number };
+    expect(trustedRows.count).toBe(0);
+    expect(epochRows.count).toBe(0);
   });
 
   it("backfills legacy tool_call_id values from metadata.raw.call_id", () => {
@@ -1237,6 +1553,7 @@ describe("runLcmMigrations summary depth backfill", () => {
     });
 
     expect(logMessages.filter((message) => message.includes("migration step skipped"))).toEqual([
+      "[lcm] migration step skipped: step=repairOpenClawMetadataIdentityState algorithmVersion=2 reason=already-complete",
       "[lcm] migration step skipped: step=backfillSummaryDepths algorithmVersion=1 reason=already-complete",
       "[lcm] migration step skipped: step=backfillSummaryMetadata algorithmVersion=1 reason=already-complete",
       "[lcm] migration step skipped: step=backfillToolCallColumns algorithmVersion=1 reason=already-complete",
@@ -1263,6 +1580,21 @@ describe("runLcmMigrations summary depth backfill", () => {
     const beginStatements = execCalls.filter((sql) => sql.startsWith("BEGIN"));
     expect(beginStatements).toEqual(["BEGIN EXCLUSIVE"]);
     expect(execCalls.at(-1)).toBe("COMMIT");
+  });
+
+  it("adds messages.stable_event_key column and partial unique index", () => {
+    const db = createTestDb("stable-event-key.db");
+    runLcmMigrations(db, { fts5Available: false });
+
+    const cols = db.prepare(`PRAGMA table_info(messages)`).all() as Array<{ name: string }>;
+    expect(cols.some((c) => c.name === "stable_event_key")).toBe(true);
+
+    const idx = db
+      .prepare(
+        `SELECT 1 FROM sqlite_master WHERE type='index' AND name='messages_stable_event_key_unique'`,
+      )
+      .get();
+    expect(idx).toBeDefined();
   });
 
   it("retries a versioned backfill cleanly after the state write fails", () => {
@@ -1335,6 +1667,7 @@ describe("runLcmMigrations summary depth backfill", () => {
       { step_name: "backfillSummaryDepths", algorithm_version: 1 },
       { step_name: "backfillSummaryMetadata", algorithm_version: 1 },
       { step_name: "backfillToolCallColumns", algorithm_version: 1 },
+      { step_name: "repairOpenClawMetadataIdentityState", algorithm_version: 2 },
     ]);
   });
 });

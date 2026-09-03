@@ -1,9 +1,13 @@
 {
   "name": "@martian-engineering/lossless-claw",
-  "version": "0.12.1-fork.1",
-  "description": "Lossless Context Management plugin for OpenClaw — DAG-based conversation summarization with threshold compaction (fork by richants)",
+  "version": "1.0.0",
+  "description": "Lossless Context Management plugin for OpenClaw — DAG-based conversation summarization with threshold compaction",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "lcm": "dist/cli.js",
+    "lossless-claw-migrate-sessions": "dist/migrate-sessions.js"
+  },
   "license": "MIT",
   "author": "Josh Lehman <josh@martian.engineering>",
   "keywords": [
@@ -16,11 +20,15 @@
     "dag"
   ],
   "scripts": {
-    "build": "esbuild index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.js --external:openclaw --external:\"@earendil-works/*\" --minify-whitespace",
+    "build": "npm run build:plugin && npm run build:migrate-sessions && npm run build:cli",
+    "build:plugin": "esbuild index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/index.js --external:openclaw --external:\"@earendil-works/*\" --minify-whitespace",
+    "build:migrate-sessions": "esbuild src/cli/migrate-sessions.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/migrate-sessions.js --external:openclaw --external:\"@earendil-works/*\" --minify-whitespace",
+    "build:cli": "esbuild cli.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/cli.js --minify-whitespace",
     "changeset": "changeset",
     "plugin-inspector:ci": "npm exec --yes --package @openclaw/plugin-inspector@0.3.11 -- plugin-inspector ci --plugin-root . --out plugin-inspector-reports",
-    "release:verify": "npm run typecheck && npm run build && npm test && npm pack --dry-run",
+    "release:verify": "npm run typecheck && npm run build && npm test && npm run test:tui && npm pack --dry-run",
     "test": "vitest run --dir test",
+    "test:tui": "cd tui && go test ./...",
     "typecheck": "tsc --noEmit --pretty false",
     "version-packages": "changeset version"
   },
@@ -31,24 +39,25 @@
     "skills/",
     "openclaw.plugin.json",
     "docs/",
+    "!docs/superpowers/",
     "README.md",
     "LICENSE"
   ],
   "dependencies": {
-    "@earendil-works/pi-agent-core": ">=0.74 <1",
-    "@earendil-works/pi-ai": ">=0.74 <1",
-    "@earendil-works/pi-coding-agent": ">=0.74 <1",
     "@sinclair/typebox": "0.34.48"
   },
   "devDependencies": {
     "@changesets/changelog-github": "^0.6.0",
-    "@changesets/cli": "^2.30.0",
-    "esbuild": "^0.28.0",
+    "@changesets/cli": "^2.31.0",
+    "@earendil-works/pi-agent-core": "^0.79.8",
+    "@earendil-works/pi-ai": "^0.79.8",
+    "@earendil-works/pi-coding-agent": "^0.79.8",
+    "esbuild": "^0.28.1",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
+    "vitest": "^4.1.9"
   },
   "peerDependencies": {
-    "openclaw": ">=2026.5.28"
+    "openclaw": ">=2026.7.2-beta.2"
   },
   "peerDependenciesMeta": {
     "openclaw": {
@@ -63,14 +72,14 @@
       "./dist/index.js"
     ],
     "compat": {
-      "pluginApi": ">=2026.5.28",
-      "minGatewayVersion": "2026.5.28",
+      "pluginApi": ">=2026.7.2-beta.2",
+      "minGatewayVersion": "2026.7.2-beta.2",
       "tested": [
-        "2026.5.28"
+        "2026.7.2-beta.2"
       ]
     },
     "build": {
-      "openclawVersion": "2026.5.28"
+      "openclawVersion": "2026.7.2-beta.2"
     }
   },
   "repository": {

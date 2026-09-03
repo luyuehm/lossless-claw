@@ -49,7 +49,7 @@ Lists all agents discovered under `~/.openclaw/agents/`. Select an agent to see 
 
 ### Screen 2: Session List
 
-Shows JSONL session files for the selected agent, sorted by last modified time. Each entry shows the filename, last update time, message count, conversation ID (if LCM-tracked), summary count, and large file count. If an OpenClaw session has a Codex app-server binding, the row also shows a `codex:` marker with the local backend rollout row count when available.
+Shows runtime sessions for the selected agent, sorted by last activity. Each entry shows the session identifier, last update time, message count, conversation ID (if LCM-tracked), summary count, and large file count. If an OpenClaw session has a Codex app-server binding, the row also shows a `codex:` marker with the local backend rollout row count when available.
 
 Sessions load in batches of 50. Scrolling near the bottom automatically loads more.
 
@@ -288,6 +288,17 @@ lcm-tui doctor --all
 | `--timestamps` | Inject timestamps into rewrite source text |
 
 Use `--provider openai-codex` when you want ChatGPT Plus/Pro OAuth from the Codex CLI. Keep `--provider openai` for direct OpenAI-compatible HTTP calls with a raw `OPENAI_API_KEY`, including custom `--base-url` proxies.
+
+#### MiniMax regional endpoints
+
+Set `MINIMAX_API_KEY`, then select `--provider minimax` for the global endpoint or `--provider minimax-cn` for the China endpoint. Both provider IDs default to `MiniMax-M3` and use the Anthropic-compatible Messages API:
+
+| Provider ID | Default base URL |
+|-------------|------------------|
+| `minimax` | `https://api.minimax.io/anthropic` |
+| `minimax-cn` | `https://api.minimaxi.com/anthropic` |
+
+`--base-url`, `LCM_TUI_SUMMARY_BASE_URL`, and configured provider `baseUrl` values continue to override these defaults.
 
 ### `lcm-tui repair`
 

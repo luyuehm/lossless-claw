@@ -11,10 +11,15 @@ import type { SummaryStore, SummaryRecord, ContextItemRecord } from "./store/sum
 import { estimateTokens, truncateTextToEstimatedTokens } from "./estimate-tokens.js";
 import { extractFileIdsFromContent } from "./large-files.js";
 import { NOOP_LCM_LOGGER, type LcmLogger } from "./lcm-log.js";
+import {
+  formatOpenClawSenderForSummary,
+  type OpenClawSenderMetadata,
+} from "./openclaw-sender-metadata.js";
 import { LcmProviderAuthError } from "./summarize.js";
 import {
   buildDeterministicFallbackSummary,
   FALLBACK_DIRECTIVE_SUMMARY_MARKER,
+  MIN_FALLBACK_MAX_TOKENS,
 } from "./summary-fallback.js";
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -28,7 +33,7 @@ export interface CompactionDecision {
   observedTokens?: number;
   /** Raw message tokens outside the protected fresh tail, when live prompt pressure is known. */
   rawTokensOutsideTail?: number;
-  /** Projected prompt pressure after adding unsummarized raw backlog to observed tokens. */
+  /** Larger of persisted and runtime-observed prompt pressure, when observation is available. */
   projectedTokens?: number;
   currentTokens: number;
   threshold: number;
@@ -57,7 +62,7 @@ export interface CompactionConfig {
   contextThreshold: number;
   /** Number of fresh tail turns to protect (default 8) */
   freshTailCount: number;
-  /** Optional token cap for the protected fresh tail; newest message is always preserved. */
+  /** Optional token cap for the protected fresh tail; the newest user-led suffix is preserved. */
   freshTailMaxTokens?: number;
   /** Minimum number of depth-0 summaries needed for condensation. */
   leafMinFanout: number;
@@ -104,6 +109,8 @@ export interface CompactionConfig {
   timezone?: string;
   /** Maximum allowed overage factor for summaries relative to target tokens (default 3). */
   summaryMaxOverageFactor: number;
+  /** Maximum token budget for deterministic fallback summaries when the LLM summarizer fails (default 512, minimum 64). */
+  fallbackMaxTokens?: number;
   /** Injected context XML tags to strip before compaction summarization. */
   stripInjectedContextTags?: string[];
 }
@@ -128,10 +135,11 @@ type PassResult = {
   /** Token count of the newly created summary. */
   addedTokens: number;
 };
-type CondensedPassSkipped = {
+type CompactionPassSkipped = {
   skipped: "empty-source";
 };
-type CondensedPassResult = PassResult | CondensedPassSkipped;
+type LeafPassResult = (PassResult & { content: string }) | CompactionPassSkipped;
+type CondensedPassResult = PassResult | CompactionPassSkipped;
 type LeafChunkSelection = {
   items: ContextItemRecord[];
   rawTokensOutsideTail: number;
@@ -148,6 +156,13 @@ type CondensedPhaseCandidate = {
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+function resolveContextThreshold(config: CompactionConfig, override?: number): number {
+  if (typeof override === "number" && Number.isFinite(override) && override >= 0 && override <= 1) {
+    return override;
+  }
+  return config.contextThreshold;
+}
 
 
 /** Deterministically cap summary text so the persisted output stays within maxTokens. */
@@ -282,6 +297,7 @@ const MEDIA_ATTACHMENT_RAW_TYPES = new Set(["file", "image", "snapshot"]);
 const PROVIDER_REASONING_RAW_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
 const STRUCTURED_MEDIA_TEXT_KEYS = ["text", "caption", "alt", "title", "summary"] as const;
 const STRUCTURED_MEDIA_NESTED_KEYS = [
+  "value",
   "content",
   "parts",
   "items",
@@ -296,6 +312,7 @@ const STRUCTURED_MEDIA_NESTED_KEYS = [
   "query",
   "command",
 ] as const;
+const MAX_STRUCTURED_TEXT_DEPTH = 8;
 const LEADING_CLOSED_REASONING_TEXT_BLOCK_RE =
   /^<\s*(think|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\s*\/\s*\1\s*>/i;
 const STANDALONE_CLOSED_REASONING_TEXT_BLOCK_RE =
@@ -455,7 +472,7 @@ function extractSanitizedStructuredText(
   options: MeaningfulTextOptions = {},
   depth = 0,
 ): string[] {
-  if (depth >= 4 || value == null) {
+  if (depth >= MAX_STRUCTURED_TEXT_DEPTH || value == null) {
     return [];
   }
   if (typeof value === "string") {
@@ -611,6 +628,9 @@ function extractMessagePartSummaryText(part: MessagePartRecord): string {
   return sections.join("\n\n").trim();
 }
 
+/** Store capability required to rehydrate message-parts-backed leaf source. */
+export type LeafSummaryMessageContentStore = Pick<ConversationStore, "getMessageParts">;
+
 /** Identify whether a stored message part represents a media attachment. */
 function isMediaAttachmentPart(part: CreateMessagePartInput | { partType: string; metadata: string | null }): boolean {
   if (MEDIA_ATTACHMENT_PART_TYPES.has(part.partType)) {
@@ -625,6 +645,66 @@ function isMediaAttachmentPart(part: CreateMessagePartInput | { partType: string
         ? ((metadata.raw as Record<string, unknown>).type as string).trim().toLowerCase()
         : "";
   return MEDIA_ATTACHMENT_RAW_TYPES.has(rawType);
+}
+
+function annotateLeafSummaryMediaContent(content: string, parts: MessagePartRecord[]): string {
+  const hasMediaParts = parts.some((part) => isMediaAttachmentPart(part));
+  if (!hasMediaParts) {
+    return content;
+  }
+
+  const partText = parts
+    .filter((part) => !isMediaAttachmentPart(part))
+    .map((part) => (typeof part.textContent === "string" ? part.textContent : ""))
+    .map((text) => stripEmbeddedMediaPayloads(text))
+    .map((text) => text.trim())
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+  const fallbackText = extractMeaningfulMessageText(content);
+  const meaningfulText = (partText || fallbackText).trim();
+
+  if (!meaningfulText) {
+    return "[Media attachment]";
+  }
+  if (meaningfulText.includes("[with media attachment]")) {
+    return meaningfulText;
+  }
+  return `${meaningfulText} [with media attachment]`;
+}
+
+/** Resolve the sanitized message text used as source for leaf summaries. */
+export async function resolveLeafSummaryMessageContent(
+  store: LeafSummaryMessageContentStore,
+  msg: MessageRecord,
+): Promise<string> {
+  const parts = await store.getMessageParts(msg.messageId);
+  const annotatedContent = annotateLeafSummaryMediaContent(msg.content, parts);
+  const storedText = extractMeaningfulMessageText(annotatedContent);
+  if (storedText) {
+    return storedText;
+  }
+
+  if (parts.length === 0) {
+    return "";
+  }
+
+  const rehydrated = contentFromParts(
+    parts.map((part) => ({ ...part })),
+    runtimeRoleForSummary(msg.role),
+    msg.content,
+  );
+  const rehydratedText = extractMeaningfulStructuredText(rehydrated);
+  if (rehydratedText) {
+    return rehydratedText;
+  }
+
+  return parts
+    .map(extractMessagePartSummaryText)
+    .map((text) => text.trim())
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
 }
 
 // ── CompactionEngine ─────────────────────────────────────────────────────────
@@ -690,6 +770,7 @@ export class CompactionEngine {
     conversationId: number,
     tokenBudget: number,
     observedTokenCount?: number,
+    options?: { contextThreshold?: number; freshTailCount?: number },
   ): Promise<CompactionDecision> {
     const storedTokens = await this.summaryStore.getContextTokenCount(conversationId);
     const liveTokens =
@@ -699,11 +780,14 @@ export class CompactionEngine {
         ? Math.floor(observedTokenCount)
         : 0;
     const rawTokensOutsideTail =
-      liveTokens > 0 ? await this.countRawTokensOutsideFreshTail(conversationId) : undefined;
-    const projectedTokens =
-      liveTokens > 0 ? liveTokens + (rawTokensOutsideTail ?? 0) : undefined;
-    const currentTokens = Math.max(storedTokens, projectedTokens ?? liveTokens);
-    const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
+      liveTokens > 0
+        ? await this.countRawTokensOutsideFreshTail(conversationId, options?.freshTailCount)
+        : undefined;
+    const projectedTokens = liveTokens > 0 ? Math.max(storedTokens, liveTokens) : undefined;
+    const currentTokens = Math.max(storedTokens, liveTokens);
+    const threshold = Math.floor(
+      resolveContextThreshold(this.config, options?.contextThreshold) * tokenBudget,
+    );
 
     if (currentTokens > threshold) {
       return {
@@ -757,6 +841,9 @@ export class CompactionEngine {
   async compact(input: {
     conversationId: number;
     tokenBudget: number;
+    contextThreshold?: number;
+    /** Optional per-call override for freshTailCount. */
+    freshTailCount?: number;
     /** LLM call function for summarization */
     summarize: CompactionSummarizeFn;
     force?: boolean;
@@ -792,6 +879,7 @@ export class CompactionEngine {
   private async _compactLeafImpl(input: {
     conversationId: number;
     tokenBudget: number;
+    contextThreshold?: number;
     summarize: CompactionSummarizeFn;
     leafChunkTokens?: number;
     force?: boolean;
@@ -802,7 +890,9 @@ export class CompactionEngine {
     const { conversationId, tokenBudget, summarize, force } = input;
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
-    const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
+    const threshold = Math.floor(
+      resolveContextThreshold(this.config, input.contextThreshold) * tokenBudget,
+    );
     const leafTrigger = await this.evaluateLeafTrigger(conversationId, input.leafChunkTokens);
 
     if (!force && tokensBefore <= threshold && !leafTrigger.shouldCompact) {
@@ -844,8 +934,16 @@ export class CompactionEngine {
         authFailure: true,
       };
     }
+    if ("skipped" in leafResult) {
+      return {
+        actionTaken: false,
+        tokensBefore,
+        tokensAfter: tokensBefore,
+        condensed: false,
+      };
+    }
     // Delta tracking: compute token change from pass results instead of re-querying DB
-    const tokensAfterLeaf = tokensBefore - leafResult.removedTokens + leafResult.addedTokens;
+    const tokensAfterLeaf = Math.max(0, tokensBefore - leafResult.removedTokens + leafResult.addedTokens);
 
     await this.persistCompactionEvents({
       conversationId,
@@ -883,7 +981,7 @@ export class CompactionEngine {
         if (!condenseResult || "skipped" in condenseResult) {
           break;
         }
-        const passTokensAfter = passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens;
+        const passTokensAfter = Math.max(0, passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens);
         await this.persistCompactionEvents({
           conversationId,
           tokensBefore: passTokensBefore,
@@ -925,6 +1023,11 @@ export class CompactionEngine {
   async compactFullSweep(input: {
     conversationId: number;
     tokenBudget: number;
+    contextThreshold?: number;
+    /** Optional per-call override for freshTailCount. */
+    freshTailCount?: number;
+    /** Optional per-call override for leafChunkTokens. */
+    leafChunkTokens?: number;
     summarize: CompactionSummarizeFn;
     force?: boolean;
     hardTrigger?: boolean;
@@ -941,9 +1044,12 @@ export class CompactionEngine {
     operationDeadlineAt?: number;
   }): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
+    const freshTailCountOverride = input.freshTailCount;
+    const leafChunkTokensOverride = input.leafChunkTokens;
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
-    const threshold = Math.floor(this.config.contextThreshold * tokenBudget);
+    const contextThreshold = resolveContextThreshold(this.config, input.contextThreshold);
+    const threshold = Math.floor(contextThreshold * tokenBudget);
     const stopAtTokens =
       typeof input.stopAtTokens === "number" &&
       Number.isFinite(input.stopAtTokens) &&
@@ -1040,11 +1146,17 @@ export class CompactionEngine {
     // Delta tracking: maintain a running token count instead of re-querying DB
     // after each pass. The arithmetic is exact: tokensAfter = tokensBefore - removed + added.
     let runningTokens = tokensBefore;
+    let leafScanAfterOrdinal: number | undefined;
     while (true) {
       if (sweepBudgetExhausted("leaf")) {
         break;
       }
-      const leafChunk = await this.selectOldestLeafChunk(conversationId);
+      const leafChunk = await this.selectOldestLeafChunk(
+        conversationId,
+        leafChunkTokensOverride,
+        freshTailCountOverride,
+        leafScanAfterOrdinal,
+      );
       if (leafChunk.items.length === 0) {
         break;
       }
@@ -1054,18 +1166,28 @@ export class CompactionEngine {
 
       sweepIterations++;
       const passTokensBefore = runningTokens;
+      const passPreviousSummaryContent =
+        previousSummaryContent ??
+        (leafScanAfterOrdinal !== undefined
+          ? await this.resolvePriorLeafSummaryContext(conversationId, leafChunk.items)
+          : undefined);
       const leafResult = await this.leafPass(
         conversationId,
         leafChunk.items,
         summarize,
-        previousSummaryContent,
+        passPreviousSummaryContent,
         input.summaryModel,
       );
       if (!leafResult) {
         hadAuthFailure = true;
         break;
       }
-      const passTokensAfter = passTokensBefore - leafResult.removedTokens + leafResult.addedTokens;
+      if ("skipped" in leafResult) {
+        leafScanAfterOrdinal = leafChunk.items[leafChunk.items.length - 1]?.ordinal;
+        await yieldToEventLoop();
+        continue;
+      }
+      const passTokensAfter = Math.max(0, passTokensBefore - leafResult.removedTokens + leafResult.addedTokens);
       await this.persistCompactionEvents({
         conversationId,
         tokensBefore: passTokensBefore,
@@ -1081,6 +1203,9 @@ export class CompactionEngine {
       previousSummaryContent = leafResult.content;
       runningTokens = passTokensAfter;
 
+      if (stopAtTokens !== undefined && runningTokens <= stopAtTokens) {
+        break;
+      }
       if (passTokensAfter >= passTokensBefore || passTokensAfter >= previousTokens) {
         break;
       }
@@ -1092,9 +1217,12 @@ export class CompactionEngine {
 
     // Phase 2: depth-aware condensed passes, always processing shallowest depth first.
     const preferredMaxSourceDepth = this.resolveSweepMaxDepth();
-    const summaryPrefixTargetTokens = this.resolveSummaryPrefixTargetTokens(tokenBudget);
+    const summaryPrefixTargetTokens = this.resolveSummaryPrefixTargetTokens(
+      tokenBudget,
+      contextThreshold,
+    );
     const hasSummaryPrefixPressure = async (): Promise<boolean> =>
-      (await this.countSummaryTokensOutsideFreshTail(conversationId)) > summaryPrefixTargetTokens;
+      (await this.countSummaryTokensOutsideFreshTail(conversationId, freshTailCountOverride)) > summaryPrefixTargetTokens;
     const hasStopTargetPressure = (): boolean =>
       stopAtTokens !== undefined && runningTokens > stopAtTokens;
     const hasCondensationPressure = async (): Promise<boolean> =>
@@ -1136,7 +1264,7 @@ export class CompactionEngine {
       if ("skipped" in condenseResult) {
         return "no-progress";
       }
-      const passTokensAfter = passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens;
+      const passTokensAfter = Math.max(0, passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens);
       await this.persistCompactionEvents({
         conversationId,
         tokensBefore: passTokensBefore,
@@ -1228,6 +1356,11 @@ export class CompactionEngine {
   async compactUntilUnder(input: {
     conversationId: number;
     tokenBudget: number;
+    contextThreshold?: number;
+    /** Optional per-call override for freshTailCount. */
+    freshTailCount?: number;
+    /** Optional per-call override for leafChunkTokens. */
+    leafChunkTokens?: number;
     targetTokens?: number;
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
@@ -1239,6 +1372,11 @@ export class CompactionEngine {
   private async _compactUntilUnderImpl(input: {
     conversationId: number;
     tokenBudget: number;
+    contextThreshold?: number;
+    /** Optional per-call override for freshTailCount. */
+    freshTailCount?: number;
+    /** Optional per-call override for leafChunkTokens. */
+    leafChunkTokens?: number;
     targetTokens?: number;
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
@@ -1298,6 +1436,13 @@ export class CompactionEngine {
       const result = await this.compact({
         conversationId,
         tokenBudget,
+        contextThreshold: input.contextThreshold,
+        ...(input.freshTailCount !== undefined
+          ? { freshTailCount: input.freshTailCount }
+          : {}),
+        ...(input.leafChunkTokens !== undefined
+          ? { leafChunkTokens: input.leafChunkTokens }
+          : {}),
         summarize,
         force: true,
         summaryModel: input.summaryModel,
@@ -1392,8 +1537,15 @@ export class CompactionEngine {
    *
    * Messages with ordinal >= returned value are preserved as fresh tail.
    */
-  private async resolveFreshTailOrdinal(contextItems: ContextItemRecord[]): Promise<number> {
-    const freshTailCount = this.resolveFreshTailCount();
+  private async resolveFreshTailOrdinal(
+    contextItems: ContextItemRecord[],
+    freshTailCountOverride?: number,
+    messageCache = new Map<number, MessageRecord | null>(),
+  ): Promise<number> {
+    const freshTailCount =
+      (freshTailCountOverride !== undefined && freshTailCountOverride > 0
+        ? freshTailCountOverride
+        : this.resolveFreshTailCount());
     if (freshTailCount <= 0) {
       return Infinity;
     }
@@ -1409,9 +1561,15 @@ export class CompactionEngine {
     let protectedCount = 0;
     let protectedTokens = 0;
     let tailStartOrdinal = Infinity;
+    const latestUserOrdinal = await this.resolveLatestRawUserOrdinal(
+      rawMessageItems,
+      messageCache,
+    );
 
     for (let idx = rawMessageItems.length - 1; idx >= 0; idx--) {
-      if (protectedCount >= freshTailCount) {
+      const latestUserProtected =
+        latestUserOrdinal === undefined || tailStartOrdinal <= latestUserOrdinal;
+      if (latestUserProtected && protectedCount >= freshTailCount) {
         break;
       }
 
@@ -1420,8 +1578,9 @@ export class CompactionEngine {
         continue;
       }
 
-      const messageTokens = await this.getMessageTokenCount(item.messageId);
+      const messageTokens = await this.getMessageTokenCount(item.messageId, messageCache);
       const wouldExceedBudget =
+        latestUserProtected &&
         protectedCount > 0 &&
         typeof freshTailMaxTokens === "number" &&
         protectedTokens + messageTokens > freshTailMaxTokens;
@@ -1437,26 +1596,61 @@ export class CompactionEngine {
     return tailStartOrdinal;
   }
 
-  /** Resolve message token count with a content-length fallback. */
-  private async getMessageTokenCount(messageId: number): Promise<number> {
-    const message = await this.conversationStore.getMessageById(messageId);
+  /** Find the newest raw user ordinal so fresh-tail limits cannot split its turn. */
+  private async resolveLatestRawUserOrdinal(
+    rawMessageItems: ContextItemRecord[],
+    messageCache: Map<number, MessageRecord | null>,
+  ): Promise<number | undefined> {
+    for (let idx = rawMessageItems.length - 1; idx >= 0; idx--) {
+      const item = rawMessageItems[idx];
+      if (!item?.messageId) {
+        continue;
+      }
+      const message = await this.getMessageByIdCached(item.messageId, messageCache);
+      if (message?.role === "user") {
+        return item.ordinal;
+      }
+    }
+    return undefined;
+  }
+
+  /** Read one message at most once while resolving a fresh-tail boundary. */
+  private async getMessageByIdCached(
+    messageId: number,
+    messageCache: Map<number, MessageRecord | null>,
+  ): Promise<MessageRecord | null> {
+    if (!messageCache.has(messageId)) {
+      messageCache.set(messageId, await this.conversationStore.getMessageById(messageId));
+    }
+    return messageCache.get(messageId) ?? null;
+  }
+
+  /** Resolve leaf-source token count, including rendered sender identity. */
+  private async getMessageTokenCount(
+    messageId: number,
+    messageCache?: Map<number, MessageRecord | null>,
+  ): Promise<number> {
+    const message = messageCache
+      ? await this.getMessageByIdCached(messageId, messageCache)
+      : await this.conversationStore.getMessageById(messageId);
     if (!message) {
       return 0;
     }
-    if (
-      typeof message.tokenCount === "number" &&
-      Number.isFinite(message.tokenCount) &&
-      message.tokenCount > 0
-    ) {
-      return message.tokenCount;
-    }
-    return estimateTokens(message.content);
+    return this.resolveMessageTokenCount(message);
   }
 
   /** Sum raw message tokens outside the protected fresh tail. */
-  private async countRawTokensOutsideFreshTail(conversationId: number): Promise<number> {
+  private async countRawTokensOutsideFreshTail(
+    conversationId: number,
+    freshTailCountOverride?: number,
+  ): Promise<number> {
     const contextItems = await this.getContextItemsCached(conversationId);
-    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems);
+    const messageCache = new Map<number, MessageRecord | null>();
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(
+      contextItems,
+      freshTailCountOverride,
+      messageCache,
+    );
     let rawTokens = 0;
 
     for (const item of contextItems) {
@@ -1466,16 +1660,19 @@ export class CompactionEngine {
       if (item.itemType !== "message" || item.messageId == null) {
         continue;
       }
-      rawTokens += await this.getMessageTokenCount(item.messageId);
+      rawTokens += await this.getMessageTokenCount(item.messageId, messageCache);
     }
 
     return rawTokens;
   }
 
   /** Sum summary tokens outside the protected fresh tail. */
-  private async countSummaryTokensOutsideFreshTail(conversationId: number): Promise<number> {
+  private async countSummaryTokensOutsideFreshTail(
+    conversationId: number,
+    freshTailCountOverride?: number,
+  ): Promise<number> {
     const contextItems = await this.getContextItemsCached(conversationId);
-    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems, freshTailCountOverride);
     let summaryTokens = 0;
 
     for (const item of contextItems) {
@@ -1503,9 +1700,11 @@ export class CompactionEngine {
   private async selectOldestLeafChunk(
     conversationId: number,
     leafChunkTokensOverride?: number,
+    freshTailCountOverride?: number,
+    afterOrdinal?: number,
   ): Promise<LeafChunkSelection> {
     const contextItems = await this.getContextItemsCached(conversationId);
-    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems, freshTailCountOverride);
     const threshold = this.resolveLeafChunkTokens(leafChunkTokensOverride);
 
     let rawTokensOutsideTail = 0;
@@ -1525,6 +1724,9 @@ export class CompactionEngine {
     for (const item of contextItems) {
       if (item.ordinal >= freshTailOrdinal) {
         break;
+      }
+      if (afterOrdinal !== undefined && item.ordinal <= afterOrdinal) {
+        continue;
       }
 
       if (!started) {
@@ -1623,16 +1825,24 @@ export class CompactionEngine {
     return extractMeaningfulSummaryText(summary.content).trim().length > 0;
   }
 
-  /** Resolve message token count with content-length fallback. */
-  private resolveMessageTokenCount(message: { tokenCount: number; content: string }): number {
-    if (
+  /** Resolve leaf-source tokens with content and rendered sender metadata. */
+  private resolveMessageTokenCount(
+    message: Pick<
+      MessageRecord,
+      "role" | "tokenCount" | "content" | "openClawSenderMetadata"
+    >,
+  ): number {
+    const contentTokens =
       typeof message.tokenCount === "number" &&
       Number.isFinite(message.tokenCount) &&
       message.tokenCount > 0
-    ) {
-      return message.tokenCount;
-    }
-    return estimateTokens(message.content);
+        ? message.tokenCount
+        : estimateTokens(message.content);
+    const sender =
+      message.role === "user"
+        ? formatOpenClawSenderForSummary(message.openClawSenderMetadata)
+        : null;
+    return contentTokens + (sender ? estimateTokens(sender) : 0);
   }
 
   private resolveLeafMinFanout(): number {
@@ -1711,7 +1921,7 @@ export class CompactionEngine {
   }
 
   /** Resolve the summarized-prefix pressure target for this token budget. */
-  private resolveSummaryPrefixTargetTokens(tokenBudget: number): number {
+  private resolveSummaryPrefixTargetTokens(tokenBudget: number, contextThresholdOverride?: number): number {
     if (
       typeof this.config.summaryPrefixTargetTokens === "number" &&
       Number.isFinite(this.config.summaryPrefixTargetTokens) &&
@@ -1719,7 +1929,10 @@ export class CompactionEngine {
     ) {
       return Math.floor(this.config.summaryPrefixTargetTokens);
     }
-    const threshold = Math.max(1, Math.floor(this.config.contextThreshold * tokenBudget));
+    const threshold = Math.max(
+      1,
+      Math.floor(resolveContextThreshold(this.config, contextThresholdOverride) * tokenBudget),
+    );
     const derivedTarget = Math.floor(threshold * 0.5);
     return Math.max(
       this.config.condensedTargetTokens,
@@ -1916,20 +2129,23 @@ export class CompactionEngine {
   }): Promise<{ content: string; level: CompactionLevel } | null> {
     const sourceText = typeof params.sourceText === "string" ? params.sourceText.trim() : "";
     if (!sourceText) {
-      return {
-        content: "[Truncated from 0 tokens]",
-        level: "fallback",
-      };
+      return null;
     }
     const inputTokens = Math.max(1, estimateTokens(sourceText));
+    const fallbackMaxTokens =
+      typeof this.config.fallbackMaxTokens === "number" &&
+      Number.isFinite(this.config.fallbackMaxTokens) &&
+      this.config.fallbackMaxTokens >= MIN_FALLBACK_MAX_TOKENS
+        ? Math.floor(this.config.fallbackMaxTokens)
+        : FALLBACK_MAX_TOKENS;
     const buildDeterministicFallback = (): { content: string; level: CompactionLevel } => {
       const truncationNote = `[Truncated from ${inputTokens} tokens]`;
       const directiveOmissionNote = [
         FALLBACK_DIRECTIVE_SUMMARY_MARKER,
         truncationNote,
       ].join("\n");
-      const content = buildDeterministicFallbackSummary(sourceText, FALLBACK_MAX_TOKENS, {
-        maxTokens: FALLBACK_MAX_TOKENS,
+      const content = buildDeterministicFallbackSummary(sourceText, fallbackMaxTokens, {
+        maxTokens: fallbackMaxTokens,
         truncationNote,
         directiveOmissionNote,
         alwaysAppendNote: true,
@@ -2003,91 +2219,6 @@ export class CompactionEngine {
     return { content: summaryText, level };
   }
 
-  // ── Private: Media Annotation ────────────────────────────────────────────
-
-  /**
-   * Annotate a message's content with media context when it has file/media
-   * attachments. This gives the summarizer enough context to produce a
-   * meaningful summary instead of trying to compress raw file paths.
-   *
-   * - Media-only messages: content is replaced with "[Media attachment]".
-   * - Media-mostly messages: text is preserved and annotated with
-   *   " [with media attachment]".
-   * - Text-only messages: returned unchanged.
-   */
-  private async annotateMediaContent(
-    messageId: number,
-    content: string,
-    preloadedParts?: MessagePartRecord[],
-  ): Promise<string> {
-    const parts = preloadedParts ?? (await this.conversationStore.getMessageParts(messageId));
-    const hasMediaParts = parts.some((part) => isMediaAttachmentPart(part));
-    if (!hasMediaParts) {
-      return content;
-    }
-
-    const partText = parts
-      .filter((part) => !isMediaAttachmentPart(part))
-      .map((part) => (typeof part.textContent === "string" ? part.textContent : ""))
-      .map((text) => stripEmbeddedMediaPayloads(text))
-      .map((text) => text.trim())
-      .filter(Boolean)
-      .join("\n")
-      .trim();
-    const fallbackText = extractMeaningfulMessageText(content);
-    const meaningfulText = (partText || fallbackText).trim();
-
-    if (!meaningfulText) {
-      return "[Media attachment]";
-    }
-    if (meaningfulText.includes("[with media attachment]")) {
-      return meaningfulText;
-    }
-    return `${meaningfulText} [with media attachment]`;
-  }
-
-  /**
-   * Reconstruct the text used by leaf summaries from stored message data.
-   *
-   * Plain `messages.content` is preferred when present, but structured tool
-   * calls/results often store their actual payload in `message_parts` while the
-   * fallback content column is empty. Rehydrating through the assembler helper
-   * keeps compaction aligned with the prompt assembly path.
-   */
-  private async resolveLeafSummaryMessageContent(msg: MessageRecord): Promise<string> {
-    const parts = await this.conversationStore.getMessageParts(msg.messageId);
-    const annotatedContent = await this.annotateMediaContent(
-      msg.messageId,
-      msg.content,
-      parts,
-    );
-    const storedText = extractMeaningfulMessageText(annotatedContent);
-    if (storedText) {
-      return storedText;
-    }
-
-    if (parts.length === 0) {
-      return "";
-    }
-
-    const rehydrated = contentFromParts(
-      parts.map((part) => ({ ...part })),
-      runtimeRoleForSummary(msg.role),
-      msg.content,
-    );
-    const rehydratedText = extractMeaningfulStructuredText(rehydrated);
-    if (rehydratedText) {
-      return rehydratedText;
-    }
-
-    return parts
-      .map(extractMessagePartSummaryText)
-      .map((text) => text.trim())
-      .filter(Boolean)
-      .join("\n\n")
-      .trim();
-  }
-
   // ── Private: Leaf Pass ───────────────────────────────────────────────────
 
   /**
@@ -2099,10 +2230,16 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn,
     previousSummaryContent?: string,
     summaryModel?: string,
-  ): Promise<{ summaryId: string; level: CompactionLevel; content: string; removedTokens: number; addedTokens: number } | null> {
+  ): Promise<LeafPassResult | null> {
     // Fetch full message content for each context item
-    const messageContents: { messageId: number; content: string; createdAt: Date; tokenCount: number }[] =
-      [];
+    const messageContents: {
+      messageId: number;
+      role: MessageRole;
+      content: string;
+      createdAt: Date;
+      tokenCount: number;
+      openClawSenderMetadata: OpenClawSenderMetadata | null;
+    }[] = [];
     for (const item of messageItems) {
       if (item.messageId == null) {
         continue;
@@ -2111,11 +2248,20 @@ export class CompactionEngine {
       if (msg) {
         messageContents.push({
           messageId: msg.messageId,
-          content: await this.resolveLeafSummaryMessageContent(msg),
+          role: msg.role,
+          content: await resolveLeafSummaryMessageContent(this.conversationStore, msg),
           createdAt: msg.createdAt,
           tokenCount: this.resolveMessageTokenCount(msg),
+          openClawSenderMetadata: msg.openClawSenderMetadata,
         });
       }
+    }
+
+    if (messageContents.length === 0) {
+      this.log.warn(
+        `[lcm] leaf compaction skipped; no valid messages; conversationId=${conversationId}; items=${messageItems.length}`,
+      );
+      return { skipped: "empty-source" };
     }
 
     const concatenated = messageContents
@@ -2126,10 +2272,23 @@ export class CompactionEngine {
         const cleaned = stripInjectedContextBlocks(message.content, this.config.stripInjectedContextTags);
         const text = extractMeaningfulMessageText(cleaned);
         if (!text) return null;
-        return `[${formatTimestamp(message.createdAt, this.config.timezone)}]\n${text}`;
+        // Role stays in the header line so the summarizer can tell an operator
+        // instruction from material a tool fetched out of another conversation.
+        const sender =
+          message.role === "user"
+            ? formatOpenClawSenderForSummary(message.openClawSenderMetadata)
+            : null;
+        const senderSuffix = sender ? ` | ${sender}` : "";
+        return `[${formatTimestamp(message.createdAt, this.config.timezone)} | ${message.role}${senderSuffix}]\n${text}`;
       })
       .filter((s): s is string => s !== null)
       .join("\n\n");
+    if (!concatenated.trim()) {
+      this.log.warn(
+        `[lcm] leaf compaction skipped; no meaningful content; conversationId=${conversationId}; chunkMessages=${messageContents.length}`,
+      );
+      return { skipped: "empty-source" };
+    }
     const fileIds = dedupeOrderedIds(
       messageContents.flatMap((message) => extractFileIdsFromContent(message.content)),
     );
@@ -2152,11 +2311,10 @@ export class CompactionEngine {
     // Persist the leaf summary
     const summaryId = generateSummaryId(summary.content);
     const tokenCount = estimateTokens(summary.content);
-    // Note: removedTokens uses resolveMessageTokenCount values (which fall back to
-    // estimateTokens for messages with token_count <= 0). This can diverge from
-    // getContextTokenCount() which would sum the stored 0. The delta feeds into
-    // stopping decisions (threshold checks, progress guards), but the divergence
-    // is bounded to empty/corrupt messages (token_count=0) which are rare.
+    // removedTokens reflects the complete leaf source, including rendered sender
+    // identity and the content fallback for invalid stored token counts. It can
+    // exceed getContextTokenCount(), which stores content tokens only, but that
+    // keeps chunk/progress accounting aligned with actual summarizer input.
     // For summaries, removedTokens matches the DB exactly (same tokenCount column).
     const removedTokens = messageContents.reduce(
       (sum, message) => sum + Math.max(0, Math.floor(message.tokenCount)),

@@ -43,15 +43,7 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
       largeFileSummaryModel: "",
       timezone: "UTC",
       pruneHeartbeatOk: false,
-      transcriptGcEnabled: false,
       proactiveThresholdCompactionMode: "deferred",
-      autoRotateSessionFiles: {
-        enabled: true,
-        createBackups: false,
-        sizeBytes: 2 * 1024 * 1024,
-        startup: "rotate",
-        runtime: "rotate",
-      },
       summaryMaxOverageFactor: 3,
     },
     complete: vi.fn(async () => ({
@@ -68,7 +60,6 @@ function makeDeps(overrides?: Partial<LcmDependencies>): LcmDependencies {
     buildSubagentSystemPrompt: vi.fn(() => ""),
     readLatestAssistantReply: vi.fn(() => undefined),
     resolveAgentDir: vi.fn(() => "/tmp/openclaw-agent"),
-    resolveSessionIdFromSessionKey: vi.fn(async () => undefined),
     agentLaneSubagent: "subagent",
     log: {
       info: vi.fn(),
@@ -117,6 +108,34 @@ describe("createLcmSummarizeFromLegacyParams", () => {
         },
       }),
     ).resolves.toBeUndefined();
+  });
+
+  it("resolves the effective OpenClaw default when no model candidate is supplied", async () => {
+    const deps = makeDeps({
+      resolveModel: vi.fn((modelRef?: string) => {
+        expect(modelRef).toBeUndefined();
+        return { provider: "openai-codex", model: "gpt-5.5" };
+      }),
+    });
+
+    const result = await createLcmSummarizeFromLegacyParams({
+      deps,
+      legacyParams: {},
+    });
+
+    expect(result?.model).toBe("gpt-5.5");
+    expect(vi.mocked(deps.resolveModel)).toHaveBeenCalledWith(undefined, undefined);
+
+    await result?.fn("default model summary source", false);
+    expect(vi.mocked(deps.complete)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: "openai-codex",
+        model: "gpt-5.5",
+      }),
+    );
+    expect(vi.mocked(deps.complete).mock.calls[0]?.[0]).not.toHaveProperty(
+      "runtimeModelOverride",
+    );
   });
 
   it("plugin summaryProvider alone (no summaryModel) is ignored and falls back to legacy provider", async () => {
@@ -453,6 +472,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
   it("honors configured leafTargetTokens for normal leaf summaries", async () => {
     const deps = makeDeps();
     deps.config.leafTargetTokens = 2400;
+    deps.config.enableSummaryThinking = false;
 
     const summarize = await createSummarizeFn({
       deps,
@@ -629,6 +649,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
   it("falls back deterministically when model returns empty summary output after retry", async () => {
     const deps = makeDeps({
+      config: { ...makeDeps().config, fallbackMaxTokens: 64 },
       complete: vi.fn(async () => ({
         content: [],
       })),
@@ -651,11 +672,13 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     expect(summary.length).toBeGreaterThan(0);
     expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+    expect(estimateTokens(summary)).toBeLessThanOrEqual(64);
   });
 
   it("falls back deterministically when the initial summarizer call times out", async () => {
     try {
       const deps = makeDeps({
+        config: { ...makeDeps().config, fallbackMaxTokens: 64 },
         complete: vi.fn(
           () =>
             new Promise<Awaited<ReturnType<LcmDependencies["complete"]>>>(() => {
@@ -680,6 +703,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
       expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
       expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+      expect(estimateTokens(summary)).toBeLessThanOrEqual(64);
       expect(vi.getTimerCount()).toBe(0);
 
       const diagnostics = getDepsLogText(deps);
@@ -961,12 +985,93 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
     const summary = await summarize!("H".repeat(8_000), false);
 
+    // Reasoning-only blocks are treated as private diagnostics, not summary
+    // content, even when a model returns a provider-specific summary wrapper.
     expect(summary).toContain("[LCM fallback summary; truncated for context management]");
 
     const diagnostics = getDepsLogText(deps);
     expect(diagnostics).toContain("block_types=reasoning");
     expect(diagnostics).toContain("content_preview=");
     expect(diagnostics).not.toContain("PRIVATE_TYPED_REASONING_TRACE");
+  });
+
+  it("omits summary thinking for Ollama so summaries stay in text blocks (#944)", async () => {
+    const deps = makeDeps({
+      resolveModel: vi.fn(() => ({
+        provider: "ollama",
+        model: "qwen3.5:9b",
+      })),
+      complete: vi.fn(async () => ({
+        content: [
+          {
+            type: "text",
+            text: "The input describes a text processing pipeline that...",
+          },
+        ],
+      })),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: {
+        provider: "ollama",
+        model: "qwen3.5:9b",
+      },
+    });
+
+    const summary = await summarize!("H".repeat(8_000), false);
+
+    expect(summary).toContain("text processing pipeline");
+    expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(1);
+
+    const requestOptions = vi.mocked(deps.complete).mock.calls[0]?.[0] as
+      | { reasoning?: string; reasoningIfSupported?: string }
+      | undefined;
+    expect(requestOptions?.reasoning).toBeUndefined();
+    expect(requestOptions?.reasoningIfSupported).toBeUndefined();
+  });
+
+  it("does not promote Ollama private reasoning text when a text block is also present", async () => {
+    const deps = makeDeps({
+      resolveModel: vi.fn(() => ({
+        provider: "ollama",
+        model: "qwen3.5:9b",
+      })),
+      complete: vi.fn(async () => ({
+        content: [
+          {
+            type: "reasoning",
+            text: "PRIVATE_MIXED_REASONING_TRACE",
+          },
+          {
+            type: "text",
+            text: "",
+          },
+        ],
+      })),
+    });
+
+    const summarize = await createSummarizeFn({
+      deps,
+      legacyParams: {
+        provider: "ollama",
+        model: "qwen3.5:9b",
+      },
+    });
+
+    const summary = await summarize!("H".repeat(8_000), false);
+
+    expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+    expect(summary).not.toContain("PRIVATE_MIXED_REASONING_TRACE");
+
+    const diagnostics = getDepsLogText(deps);
+    expect(diagnostics).not.toContain("PRIVATE_MIXED_REASONING_TRACE");
+
+    for (const call of vi.mocked(deps.complete).mock.calls) {
+      const requestOptions = call[0] as { reasoning?: string; reasoningIfSupported?: string };
+      expect(requestOptions.reasoning).toBeUndefined();
+      expect(requestOptions.reasoningIfSupported).toBeUndefined();
+    }
   });
 
   it("does not treat thinking-only completions as summary content", async () => {
@@ -1071,6 +1176,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     const deps = makeDeps();
     deps.config = {
       ...deps.config,
+      fallbackMaxTokens: 64,
       fallbackProviders: [{ provider: "openai", model: "gpt-4.1-mini" }],
     } as typeof deps.config;
     deps.resolveModel = vi.fn((modelRef?: string, providerHint?: string) => {
@@ -1094,6 +1200,7 @@ describe("createLcmSummarizeFromLegacyParams", () => {
     const summary = await summarize!("Q".repeat(10_000), false);
 
     expect(summary).toContain("[LCM fallback summary; truncated for context management]");
+    expect(estimateTokens(summary)).toBeLessThanOrEqual(64);
     expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
 
     const diagnostics = getDepsLogText(deps);
@@ -1674,6 +1781,96 @@ describe("createLcmSummarizeFromLegacyParams", () => {
 
       const diagnostics = getDepsLogText(deps);
       expect(diagnostics).toContain("retry succeeded");
+    });
+
+    it("grants reasoning headroom on the first call and doubles the budget on retry", async () => {
+      let callCount = 0;
+      const deps = makeDeps({
+        resolveModel: vi.fn(() => ({
+          provider: "openai",
+          model: "gpt-5.3-codex",
+        })),
+        complete: vi.fn(async () => {
+          callCount++;
+          if (callCount === 1) {
+            return { content: [] };
+          }
+          return { content: [{ type: "text", text: "Recovered summary with larger maxTokens." }] };
+        }),
+      });
+
+      const summarize = await createSummarizeFn({
+        deps,
+        legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
+      });
+
+      // Very short input so the targetTokens floor (192) applies. With summary
+      // thinking enabled (default), the first call gets reasoning headroom on
+      // top of the target, and the retry doubles the first attempt's budget.
+      const summary = await summarize!("Hi", false);
+
+      expect(summary).toBe("Recovered summary with larger maxTokens.");
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+
+      const firstArgs = vi.mocked(deps.complete).mock.calls[0]?.[0];
+      const retryArgs = vi.mocked(deps.complete).mock.calls[1]?.[0];
+
+      expect(firstArgs?.maxTokens).toBe(192 + 2048);
+      expect(retryArgs?.maxTokens).toBe((192 + 2048) * 2);
+      expect(retryArgs?.reasoning).toBe("low");
+    });
+
+    it("retry budget strictly exceeds the first attempt's when targetTokens hits the leaf cap", async () => {
+      let callCount = 0;
+      const deps = makeDeps({
+        resolveModel: vi.fn(() => ({
+          provider: "openai",
+          model: "gpt-5.3-codex",
+        })),
+        complete: vi.fn(async () => {
+          callCount++;
+          if (callCount === 1) {
+            return { content: [] };
+          }
+          return { content: [{ type: "text", text: "Recovered long-segment summary." }] };
+        }),
+      });
+
+      const summarize = await createSummarizeFn({
+        deps,
+        legacyParams: { provider: "openai", model: "gpt-5.3-codex" },
+      });
+
+      // Long input so targetTokens saturates at leafTargetTokens (600). The
+      // retry must still send a strictly larger budget than the first call —
+      // a verbatim replay of an exhausted budget would fail identically.
+      const summary = await summarize!("A".repeat(40_000), false);
+
+      expect(summary).toBe("Recovered long-segment summary.");
+      expect(vi.mocked(deps.complete)).toHaveBeenCalledTimes(2);
+
+      const firstMaxTokens = Number(vi.mocked(deps.complete).mock.calls[0]?.[0]?.maxTokens);
+      const retryMaxTokens = Number(vi.mocked(deps.complete).mock.calls[1]?.[0]?.maxTokens);
+
+      expect(firstMaxTokens).toBe(600 + 2048);
+      expect(retryMaxTokens).toBeGreaterThan(firstMaxTokens);
+      expect(retryMaxTokens).toBe((600 + 2048) * 2);
+    });
+
+    it("omits reasoning headroom when summary thinking is disabled", async () => {
+      const deps = makeDeps();
+      deps.config.enableSummaryThinking = false;
+
+      const summarize = await createSummarizeFn({
+        deps,
+        legacyParams: { provider: "anthropic", model: "claude-opus-4-5" },
+      });
+
+      await summarize!("Hi", false);
+
+      const firstArgs = vi.mocked(deps.complete).mock.calls[0]?.[0];
+      expect(firstArgs?.maxTokens).toBe(192);
+      expect(firstArgs?.reasoningIfSupported).toBeUndefined();
     });
 
     it("falls back to truncation when retry also returns empty for non-text-only blocks", async () => {

@@ -3,7 +3,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import manifest from "../openclaw.plugin.json" with { type: "json" };
 import {
-  DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES,
   DEFAULT_CRITICAL_BUDGET_PRESSURE_RATIO,
   DEFAULT_SUMMARY_CALL_WINDOW_MS,
   DEFAULT_SUMMARY_MAX_CALLS_PER_WINDOW,
@@ -25,12 +24,14 @@ describe("resolveLcmConfig", () => {
   it("uses hardcoded defaults when no env or plugin config", () => {
     const config = resolveLcmConfig({}, {});
     expect(config.enabled).toBe(true);
+    expect(config.hostFallbackMode).toBe("error");
     expect(config.databasePath).toBe(join(homedir(), ".openclaw", "lcm.db"));
     expect(config.largeFilesDir).toBe(join(homedir(), ".openclaw", "lcm-files"));
     expect(config.ignoreSessionPatterns).toEqual([]);
     expect(config.statelessSessionPatterns).toEqual([]);
     expect(config.skipStatelessSessions).toBe(true);
     expect(config.contextThreshold).toBe(0.75);
+    expect(config.contextThresholdOverrides).toEqual([]);
     expect(config.freshTailCount).toBe(64);
     expect(config.freshTailMaxTokens).toBeUndefined();
     expect(config.promptAwareEviction).toBe(false);
@@ -52,15 +53,7 @@ describe("resolveLcmConfig", () => {
     expect(config.summaryMaxCallsPerWindow).toBe(DEFAULT_SUMMARY_MAX_CALLS_PER_WINDOW);
     expect(config.summarySpendBackoffMs).toBe(DEFAULT_SUMMARY_SPEND_BACKOFF_MS);
     expect(config.pruneHeartbeatOk).toBe(false);
-    expect(config.transcriptGcEnabled).toBe(false);
     expect(config.proactiveThresholdCompactionMode).toBe("deferred");
-    expect(config.autoRotateSessionFiles).toEqual({
-      enabled: true,
-      createBackups: false,
-      sizeBytes: DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES,
-      startup: "rotate",
-      runtime: "rotate",
-    });
     expect(config.cacheAwareCompaction).toEqual({
       enabled: true,
       cacheTTLSeconds: 300,
@@ -79,6 +72,19 @@ describe("resolveLcmConfig", () => {
   it("reads values from plugin config", () => {
     const config = resolveLcmConfig({}, {
       contextThreshold: 0.5,
+      contextThresholdOverrides: [
+        {
+          name: "large-context",
+          match: { modelContextWindowMin: 900000 },
+          contextThreshold: 0.15,
+          freshTailCount: 16,
+          leafChunkTokens: 12000,
+        },
+        {
+          match: { model: "openai/gpt-5.5", sessionPattern: "agent:*:telegram:**" },
+          contextThreshold: 0.35,
+        },
+      ],
       freshTailCount: 16,
       freshTailMaxTokens: 12000,
       promptAwareEviction: false,
@@ -99,15 +105,7 @@ describe("resolveLcmConfig", () => {
       leafMinFanout: 4,
       condensedMinFanout: 2,
       pruneHeartbeatOk: true,
-      transcriptGcEnabled: true,
       proactiveThresholdCompactionMode: "inline",
-      autoRotateSessionFiles: {
-        enabled: false,
-        createBackups: true,
-        sizeBytes: 123456,
-        startup: "warn",
-        runtime: "off",
-      },
       enabled: false,
       cacheAwareCompaction: {
         enabled: false,
@@ -130,6 +128,19 @@ describe("resolveLcmConfig", () => {
     expect(config.statelessSessionPatterns).toEqual(["agent:*:ephemeral:**"]);
     expect(config.skipStatelessSessions).toBe(false);
     expect(config.contextThreshold).toBe(0.5);
+    expect(config.contextThresholdOverrides).toEqual([
+      {
+        name: "large-context",
+        match: { modelContextWindowMin: 900000 },
+        contextThreshold: 0.15,
+        freshTailCount: 16,
+        leafChunkTokens: 12000,
+      },
+      {
+        match: { model: "openai/gpt-5.5", sessionPattern: "agent:*:telegram:**" },
+        contextThreshold: 0.35,
+      },
+    ]);
     expect(config.freshTailCount).toBe(16);
     expect(config.freshTailMaxTokens).toBe(12000);
     expect(config.promptAwareEviction).toBe(false);
@@ -147,15 +158,7 @@ describe("resolveLcmConfig", () => {
     expect(config.leafMinFanout).toBe(4);
     expect(config.condensedMinFanout).toBe(2);
     expect(config.pruneHeartbeatOk).toBe(true);
-    expect(config.transcriptGcEnabled).toBe(true);
     expect(config.proactiveThresholdCompactionMode).toBe("inline");
-    expect(config.autoRotateSessionFiles).toEqual({
-      enabled: false,
-      createBackups: true,
-      sizeBytes: 123456,
-      startup: "warn",
-      runtime: "off",
-    });
     expect(config.cacheAwareCompaction).toEqual({
       enabled: false,
       cacheTTLSeconds: 900,
@@ -171,6 +174,25 @@ describe("resolveLcmConfig", () => {
     });
   });
 
+  it("resolves hostFallbackMode from plugin config and env override", () => {
+    expect(resolveLcmConfig({}, { hostFallbackMode: "capture-only" }).hostFallbackMode).toBe(
+      "capture-only",
+    );
+    expect(
+      resolveLcmConfig(
+        { LCM_HOST_FALLBACK_MODE: "capture-only" } as NodeJS.ProcessEnv,
+        {},
+      ).hostFallbackMode,
+    ).toBe("capture-only");
+    expect(
+      resolveLcmConfig(
+        { LCM_HOST_FALLBACK_MODE: "error" } as NodeJS.ProcessEnv,
+        { hostFallbackMode: "capture-only" },
+      ).hostFallbackMode,
+    ).toBe("error");
+    expect(resolveLcmConfig({}, { hostFallbackMode: "bogus" }).hostFallbackMode).toBe("error");
+  });
+
   it("env vars override plugin config", () => {
     const env = {
       LCM_CONTEXT_THRESHOLD: "0.9",
@@ -182,12 +204,6 @@ describe("resolveLcmConfig", () => {
       LCM_IGNORE_SESSION_PATTERNS: "agent:*:cron:*, agent:main:subagent:**",
       LCM_STATELESS_SESSION_PATTERNS: "agent:*:ephemeral:**, agent:main:preview:*",
       LCM_SKIP_STATELESS_SESSIONS: "false",
-      LCM_TRANSCRIPT_GC_ENABLED: "true",
-      LCM_AUTO_ROTATE_SESSION_FILES_ENABLED: "false",
-      LCM_AUTO_ROTATE_SESSION_FILES_CREATE_BACKUPS: "true",
-      LCM_AUTO_ROTATE_SESSION_FILES_SIZE_BYTES: "987654",
-      LCM_AUTO_ROTATE_SESSION_FILES_STARTUP: "warn",
-      LCM_AUTO_ROTATE_SESSION_FILES_RUNTIME: "off",
       LCM_CACHE_AWARE_COMPACTION_ENABLED: "false",
       LCM_CACHE_TTL_SECONDS: "600",
       LCM_MAX_COLD_CACHE_CATCHUP_PASSES: "4",
@@ -224,15 +240,7 @@ describe("resolveLcmConfig", () => {
       ignoreSessionPatterns: ["agent:*:test:*"],
       statelessSessionPatterns: ["agent:*:preview:*"],
       skipStatelessSessions: true,
-      transcriptGcEnabled: false,
       proactiveThresholdCompactionMode: "deferred",
-      autoRotateSessionFiles: {
-        enabled: true,
-        createBackups: false,
-        sizeBytes: 123456,
-        startup: "rotate",
-        runtime: "rotate",
-      },
       enabled: true,
       cacheAwareCompaction: {
         enabled: true,
@@ -258,15 +266,7 @@ describe("resolveLcmConfig", () => {
       "agent:main:preview:*",
     ]);
     expect(config.skipStatelessSessions).toBe(false);
-    expect(config.transcriptGcEnabled).toBe(true);
     expect(config.proactiveThresholdCompactionMode).toBe("inline");
-    expect(config.autoRotateSessionFiles).toEqual({
-      enabled: false,
-      createBackups: true,
-      sizeBytes: 987654,
-      startup: "warn",
-      runtime: "off",
-    });
     expect(config.contextThreshold).toBe(0.9); // env wins
     expect(config.freshTailCount).toBe(64); // env wins
     expect(config.freshTailMaxTokens).toBe(32000); // env wins
@@ -377,13 +377,6 @@ describe("resolveLcmConfig", () => {
       ignoreSessionPatterns: "agent:*:cron:*, agent:main:subagent:**",
       statelessSessionPatterns: "agent:*:ephemeral:**, agent:main:preview:*",
       skipStatelessSessions: "false",
-      autoRotateSessionFiles: {
-        enabled: "false",
-        createBackups: "true",
-        sizeBytes: "4096",
-        startup: "warn",
-        runtime: "off",
-      },
     });
     expect(config.contextThreshold).toBe(0.6);
     expect(config.freshTailCount).toBe(24);
@@ -400,13 +393,6 @@ describe("resolveLcmConfig", () => {
       "agent:main:preview:*",
     ]);
     expect(config.skipStatelessSessions).toBe(false);
-    expect(config.autoRotateSessionFiles).toEqual({
-      enabled: false,
-      createBackups: true,
-      sizeBytes: 4096,
-      startup: "warn",
-      runtime: "off",
-    });
   });
 
   it("ignores invalid plugin config values", () => {
@@ -417,13 +403,6 @@ describe("resolveLcmConfig", () => {
       promptAwareEviction: "maybe",
       newSessionRetainDepth: "nope",
       enabled: "maybe",
-      autoRotateSessionFiles: {
-        enabled: "maybe",
-        createBackups: "maybe",
-        sizeBytes: "not-a-number",
-        startup: "notify",
-        runtime: "compact",
-      },
     });
     expect(config.contextThreshold).toBe(0.75); // falls through to default
     expect(config.freshTailCount).toBe(64); // falls through to default
@@ -431,13 +410,6 @@ describe("resolveLcmConfig", () => {
     expect(config.promptAwareEviction).toBe(false); // falls through to default
     expect(config.newSessionRetainDepth).toBe(2); // falls through to default
     expect(config.enabled).toBe(true); // falls through to default
-    expect(config.autoRotateSessionFiles).toEqual({
-      enabled: true,
-      createBackups: false,
-      sizeBytes: DEFAULT_AUTO_ROTATE_SESSION_FILE_SIZE_BYTES,
-      startup: "rotate",
-      runtime: "rotate",
-    });
   });
 
   it("handles databasePath from plugin config", () => {
@@ -708,6 +680,90 @@ describe("resolveLcmConfig", () => {
     });
   });
 
+  it("ships a manifest with contextThresholdOverrides in schema", () => {
+    expect(manifest.configSchema.properties.contextThresholdOverrides).toMatchObject({
+      type: "array",
+      items: {
+        type: "object",
+        required: ["match", "contextThreshold"],
+        properties: {
+          match: {
+            type: "object",
+            minProperties: 1,
+          },
+          contextThreshold: {
+            type: "number",
+            minimum: 0,
+            maximum: 1,
+          },
+          freshTailCount: {
+            type: "integer",
+            minimum: 1,
+          },
+          leafChunkTokens: {
+            type: "integer",
+            minimum: 1,
+          },
+        },
+      },
+    });
+  });
+
+  it("rejects invalid contextThresholdOverrides", () => {
+    expect(() =>
+      resolveLcmConfig({}, {
+        contextThresholdOverrides: [
+          { match: { model: "openai/gpt-5.5" }, contextThreshold: 1.5 },
+        ],
+      })
+    ).toThrow(/contextThreshold/);
+    expect(() =>
+      resolveLcmConfig({}, {
+        contextThresholdOverrides: [
+          { match: {}, contextThreshold: 0.5 },
+        ],
+      })
+    ).toThrow(/at least one matcher/);
+    expect(() =>
+      resolveLcmConfig({}, {
+        contextThresholdOverrides: [
+          {
+            match: { modelContextWindowMin: 900000, modelContextWindowMax: 250000 },
+            contextThreshold: 0.5,
+          },
+        ],
+      })
+    ).toThrow(/modelContextWindowMin/);
+    expect(() =>
+      resolveLcmConfig({}, {
+        contextThresholdOverrides: [
+          { match: { model: "   " }, contextThreshold: 0.5 },
+        ],
+      })
+    ).toThrow(/model/);
+    expect(() =>
+      resolveLcmConfig({}, {
+        contextThresholdOverrides: [
+          { match: { sessionPattern: "" }, contextThreshold: 0.5 },
+        ],
+      })
+    ).toThrow(/sessionPattern/);
+    expect(() =>
+      resolveLcmConfig({}, {
+        contextThresholdOverrides: [
+          { match: { model: "openai/gpt-5.5" }, contextThreshold: 0.5, freshTailCount: 0 },
+        ],
+      })
+    ).toThrow(/freshTailCount/);
+    expect(() =>
+      resolveLcmConfig({}, {
+        contextThresholdOverrides: [
+          { match: { model: "openai/gpt-5.5" }, contextThreshold: 0.5, leafChunkTokens: 0 },
+        ],
+      })
+    ).toThrow(/leafChunkTokens/);
+  });
+
   it("ships a manifest with dynamicLeafChunkTokens in schema", () => {
     expect(manifest.configSchema.properties.dynamicLeafChunkTokens).toEqual({
       type: "object",
@@ -724,12 +780,6 @@ describe("resolveLcmConfig", () => {
     });
   });
 
-  it("ships a manifest with transcriptGcEnabled in schema", () => {
-    expect(manifest.configSchema.properties.transcriptGcEnabled).toEqual({
-      type: "boolean",
-    });
-  });
-
   it("ships a manifest with proactiveThresholdCompactionMode in schema", () => {
     expect(manifest.configSchema.properties.proactiveThresholdCompactionMode).toEqual({
       type: "string",
@@ -737,8 +787,15 @@ describe("resolveLcmConfig", () => {
     });
   });
 
-  it("ships a manifest with autoRotateSessionFiles in schema", () => {
+  it("accepts retired transcript maintenance settings for upgrade compatibility", () => {
+    expect(manifest.configSchema.properties.transcriptGcEnabled).toEqual({
+      description:
+        "Retired compatibility setting. Lossless Claw 1.x accepts and ignores this value.",
+      type: "boolean",
+    });
     expect(manifest.configSchema.properties.autoRotateSessionFiles).toEqual({
+      description:
+        "Retired compatibility setting. Lossless Claw 1.x accepts and ignores these values.",
       type: "object",
       additionalProperties: false,
       properties: {
@@ -841,11 +898,18 @@ describe("resolveLcmConfig", () => {
       minimum: 1,
     });
   });
+  it("ships a manifest with fallbackMaxTokens in schema", () => {
+    expect(manifest.configSchema.properties.fallbackMaxTokens).toEqual({
+      type: "integer",
+      minimum: 64,
+    });
+  });
   it("defaults summaryMaxOverageFactor to 3 and maxAssemblyTokenBudget to undefined", () => {
     const config = resolveLcmConfig({}, {});
     expect(config.bootstrapMaxTokens).toBe(6000);
     expect(config.delegationTimeoutMs).toBe(120000);
     expect(config.summaryMaxOverageFactor).toBe(3);
+    expect(config.fallbackMaxTokens).toBe(512);
     expect(config.maxAssemblyTokenBudget).toBeUndefined();
     expect(config.independentLogFile).toEqual({
       enabled: true,
@@ -929,16 +993,19 @@ describe("resolveLcmConfig", () => {
       LCM_BOOTSTRAP_MAX_TOKENS: "still-nope",
       LCM_CONTEXT_THRESHOLD: "bad",
       LCM_SUMMARY_MAX_OVERAGE_FACTOR: "nah",
+      LCM_FALLBACK_MAX_TOKENS: "not-a-number",
     } as NodeJS.ProcessEnv, {
       leafChunkTokens: 80_000,
       contextThreshold: 0.5,
       summaryMaxOverageFactor: 5,
+      fallbackMaxTokens: 768,
     });
 
     expect(config.leafChunkTokens).toBe(80_000);
     expect(config.bootstrapMaxTokens).toBe(24_000);
     expect(config.contextThreshold).toBe(0.5);
     expect(config.summaryMaxOverageFactor).toBe(5);
+    expect(config.fallbackMaxTokens).toBe(768);
   });
 
   it("reads summaryMaxOverageFactor and maxAssemblyTokenBudget from plugin config", () => {
@@ -948,6 +1015,29 @@ describe("resolveLcmConfig", () => {
     });
     expect(config.summaryMaxOverageFactor).toBe(5);
     expect(config.maxAssemblyTokenBudget).toBe(30000);
+  });
+
+  it("reads fallbackMaxTokens from plugin config", () => {
+    const config = resolveLcmConfig({}, {
+      fallbackMaxTokens: 1024,
+    });
+    expect(config.fallbackMaxTokens).toBe(1024);
+  });
+
+  it("ignores fallbackMaxTokens values below the usable minimum from env and plugin config", () => {
+    const envFallback = resolveLcmConfig({
+      LCM_FALLBACK_MAX_TOKENS: "63",
+    } as NodeJS.ProcessEnv, {
+      fallbackMaxTokens: 1024,
+    });
+    expect(envFallback.fallbackMaxTokens).toBe(1024);
+
+    const defaultFallback = resolveLcmConfig({
+      LCM_FALLBACK_MAX_TOKENS: "-1",
+    } as NodeJS.ProcessEnv, {
+      fallbackMaxTokens: 63,
+    });
+    expect(defaultFallback.fallbackMaxTokens).toBe(512);
   });
 
   it("env vars override summaryMaxOverageFactor and maxAssemblyTokenBudget", () => {
@@ -960,6 +1050,15 @@ describe("resolveLcmConfig", () => {
     });
     expect(config.summaryMaxOverageFactor).toBe(2.5);
     expect(config.maxAssemblyTokenBudget).toBe(16000);
+  });
+
+  it("env vars override fallbackMaxTokens", () => {
+    const config = resolveLcmConfig({
+      LCM_FALLBACK_MAX_TOKENS: "2048",
+    } as NodeJS.ProcessEnv, {
+      fallbackMaxTokens: 1024,
+    });
+    expect(config.fallbackMaxTokens).toBe(2048);
   });
 });
 

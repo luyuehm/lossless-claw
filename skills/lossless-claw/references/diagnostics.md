@@ -4,6 +4,21 @@ For the MVP, use the native command surface first. For debugging lossless-claw b
 
 ## Fast path
 
+### `lcm` shell CLI
+
+Use the packaged shell CLI for bounded, structured database inspection outside an OpenClaw conversation:
+
+```bash
+lcm status --pretty
+lcm conversations show --session-key 'agent:main:example'
+lcm messages tail --conversation-id 42
+lcm summaries list --conversation-id 42 --depth 0 --recency 7d
+```
+
+JSON is the default output. List commands return opaque keyset cursors. Database commands open `lcm.db` read-only and do not run migrations, repair, cleanup, compaction, or other write operations. `lcm config set` is the only state-changing shell command and edits one manifest-validated Lossless config path with a timestamped backup.
+
+Path overrides use `--db`, `LCM_DATABASE_PATH`, `--openclaw-dir`, `LCM_OPENCLAW_DIR`, `OPENCLAW_STATE_DIR`, `OPENCLAW_HOME`, `--config`, and `OPENCLAW_CONFIG_PATH`. See `docs/cli.md` in the package for precedence and the complete command contract.
+
 ### Independent Lossless log
 
 Check this first when lossless-claw needs to debug itself, because routine `[lcm]` info and debug lines are written here instead of the shared OpenClaw gateway log.
@@ -54,18 +69,41 @@ What it should help confirm:
 - whether truncation markers exist
 - which conversations are affected most
 
+### `/lossless doctor apply`
+
+Use this only after `/lossless doctor` identifies broken summaries. The command rewrites affected summary content in place after creating a database backup.
+
+- `/lossless doctor apply` repairs the current conversation and keeps the normal large/hot safety preflight.
+- `/lossless doctor apply confirm-offline` overrides that preflight for the current conversation after its active channel path has been isolated.
+- `/lossless doctor apply <conversation-id> confirm-offline` targets a specific conversation, including an archived or non-current conversation. Targeted repair always requires the explicit offline confirmation.
+
+Conversation ids are gateway-wide maintenance identifiers rather than sender ownership credentials. Only authorized OpenClaw command senders can invoke the command; before targeting an id, pause or move active delivery away from that conversation and verify the displayed session key is the intended lane.
+
+### `/lossless doctor maintenance`
+
+Use this read-only scan to separate active actionable compaction debt from inactive historical debt. It groups pending rows by active state and reason and shows only a bounded set of recent inactive examples. The scan does not run maintenance or change database state.
+
+Normal stable-session maintenance selects active conversations, so pending debt attached to an archived conversation can remain historical even though its recall data is still valuable. To close one eligible row, run:
+
+`/lossless doctor apply maintenance <conversation-id> confirm-inactive`
+
+The target must be inactive, pending, and not running. The confirmation token must be exactly `confirm-inactive`, and Lossless Claw must successfully create a backup of a file-backed SQLite database before changing the maintenance row. Active, running, missing, already-resolved, non-pending, and in-memory targets are read-only refusals; repeating a successful close performs no work and creates no additional backup.
+
+This is an administrative `operator-ignored` resolution, not successful compaction. It changes only the compaction-maintenance row and does not delete or rewrite conversations, messages, summaries, or context items. A later genuine debt request clears the resolution metadata and makes the row actionable again.
+
 ### `/lossless doctor clean`
 
 Use this when the user wants read-only diagnostics for high-confidence junk patterns before any cleanup.
 
 It should help confirm:
 
-- whether archived subagent sessions are present
-- whether cron sessions are accumulating unexpectedly
+- whether archived subagent sessions are present under any configured OpenClaw agent id
+- whether cron sessions are accumulating unexpectedly under any configured OpenClaw agent id
 - whether NULL-key orphaned subagent conversations are present
 - which high-confidence filters match the most conversations and messages
 
 This command is read-only. Use it to identify likely cleanup candidates before taking any separate cleanup action.
+Its keyed-session filters require an exact configured agent-id segment, an exact `cron` or `subagent` lane segment, and a non-empty lane suffix.
 
 ## Interpreting common states
 

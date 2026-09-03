@@ -1,5 +1,10 @@
 import type { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
 import { getLcmDbFeatures } from "./features.js";
+import {
+  canonicalizeOpenClawInboundMetadataIdentityContent,
+  canonicalizeOpenClawInboundMetadataIdentityContentBeforeHistoryRecap,
+} from "../openclaw-inbound-metadata.js";
 import { buildMessageIdentityHash } from "../store/message-identity.js";
 import { parseUtcTimestampOrNull } from "../store/parse-utc-timestamp.js";
 
@@ -42,6 +47,14 @@ type MessageIdentityBackfillRow = {
   content: string;
 };
 
+type OpenClawMetadataIdentityRepairRow = {
+  message_id: number;
+  conversation_id: number;
+  role: string;
+  content: string;
+  identity_hash: string | null;
+};
+
 type FtsTableSpec = {
   tableName: string;
   createSql: string;
@@ -54,6 +67,7 @@ const VERSIONED_BACKFILL_STEPS = {
   backfillSummaryDepths: 1,
   backfillSummaryMetadata: 1,
   backfillToolCallColumns: 1,
+  repairOpenClawMetadataIdentityState: 2,
 } as const;
 
 type VersionedBackfillStepName = keyof typeof VERSIONED_BACKFILL_STEPS;
@@ -168,6 +182,28 @@ function ensureCompactionTelemetryColumns(db: DatabaseSync): void {
   }
 }
 
+function ensureLargeFilesLineCountColumn(db: DatabaseSync): void {
+  const columns = db.prepare(`PRAGMA table_info(large_files)`).all() as SummaryColumnInfo[];
+  const hasLineCount = columns.some((col) => col.name === "line_count");
+  if (!hasLineCount) {
+    db.exec(`ALTER TABLE large_files ADD COLUMN line_count INTEGER`);
+  }
+}
+
+// Adds per-node retry bookkeeping to pending_summary_nodes for DBs created
+// before failed-node retry existed.
+function ensurePendingSummaryNodeRetryColumns(db: DatabaseSync): void {
+  const nodeColumns = db
+    .prepare(`PRAGMA table_info(pending_summary_nodes)`)
+    .all() as SummaryColumnInfo[];
+  if (!nodeColumns.some((col) => col.name === "retry_count")) {
+    db.exec(`ALTER TABLE pending_summary_nodes ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!nodeColumns.some((col) => col.name === "next_attempt_after")) {
+    db.exec(`ALTER TABLE pending_summary_nodes ADD COLUMN next_attempt_after TEXT`);
+  }
+}
+
 function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
   const maintenanceColumns = db
     .prepare(`PRAGMA table_info(conversation_compaction_maintenance)`)
@@ -184,6 +220,25 @@ function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
   const hasNextAttemptAfter = maintenanceColumns.some(
     (col) => col.name === "next_attempt_after",
   );
+  const hasContextThreshold = maintenanceColumns.some(
+    (col) => col.name === "context_threshold",
+  );
+  const hasContextThresholdSource = maintenanceColumns.some(
+    (col) => col.name === "context_threshold_source",
+  );
+  const hasContextFreshTailCount = maintenanceColumns.some(
+    (col) => col.name === "context_fresh_tail_count",
+  );
+  const hasContextLeafChunkTokens = maintenanceColumns.some(
+    (col) => col.name === "context_leaf_chunk_tokens",
+  );
+  const hasResolutionReason = maintenanceColumns.some(
+    (col) => col.name === "resolution_reason",
+  );
+  const hasResolvedAt = maintenanceColumns.some((col) => col.name === "resolved_at");
+  const hasMaintenanceRevision = maintenanceColumns.some(
+    (col) => col.name === "maintenance_revision",
+  );
 
   if (!hasProjectedTokenCount) {
     db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN projected_token_count INTEGER`);
@@ -198,6 +253,29 @@ function ensureCompactionMaintenanceColumns(db: DatabaseSync): void {
   }
   if (!hasNextAttemptAfter) {
     db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN next_attempt_after TEXT`);
+  }
+  if (!hasContextThreshold) {
+    db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN context_threshold REAL`);
+  }
+  if (!hasContextThresholdSource) {
+    db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN context_threshold_source TEXT`);
+  }
+  if (!hasContextFreshTailCount) {
+    db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN context_fresh_tail_count INTEGER`);
+  }
+  if (!hasContextLeafChunkTokens) {
+    db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN context_leaf_chunk_tokens INTEGER`);
+  }
+  if (!hasResolutionReason) {
+    db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN resolution_reason TEXT`);
+  }
+  if (!hasResolvedAt) {
+    db.exec(`ALTER TABLE conversation_compaction_maintenance ADD COLUMN resolved_at TEXT`);
+  }
+  if (!hasMaintenanceRevision) {
+    db.exec(
+      `ALTER TABLE conversation_compaction_maintenance ADD COLUMN maintenance_revision INTEGER NOT NULL DEFAULT 0`,
+    );
   }
 }
 
@@ -316,6 +394,22 @@ function ensureMessageIdentityHashColumn(db: DatabaseSync): void {
 }
 
 /**
+ * OpenClaw sender identity used for lossless group-message replay. The JSON
+ * object contains only the allowlisted senderId, senderName, and
+ * senderUsername envelope fields. NULL preserves legacy and direct-message
+ * behavior without rewriting existing rows.
+ */
+function ensureMessageOpenClawSenderMetadataColumn(db: DatabaseSync): void {
+  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const hasSenderMetadata = messageColumns.some(
+    (column) => column.name === "openclaw_sender_metadata",
+  );
+  if (!hasSenderMetadata) {
+    db.exec(`ALTER TABLE messages ADD COLUMN openclaw_sender_metadata TEXT`);
+  }
+}
+
+/**
  * v4.2 §B — stub-tier stratification: the `large_content` sidecar column.
  *
  * Stratifies the messages row into a thread-metadata tier (always emitted)
@@ -339,23 +433,80 @@ function ensureMessageLargeContentColumn(db: DatabaseSync): void {
   }
 }
 
-function ensureConversationBootstrapStateForkColumns(db: DatabaseSync): void {
-  const columns = db
-    .prepare(`PRAGMA table_info(conversation_bootstrap_state)`)
-    .all() as SummaryColumnInfo[];
-  const hasForkBounded = columns.some((col) => col.name === "fork_bounded");
-  const hasForkSourceMessageCount = columns.some(
-    (col) => col.name === "fork_source_message_count",
-  );
+/**
+ * Transcript-entry-id reconciliation: the stable JSONL envelope id of the
+ * transcript entry a message was imported from. NULL for runtime-array
+ * ingests, legacy rows, and transcripts without envelopes. The partial
+ * unique index makes transcript imports idempotent — replaying a transcript
+ * region can never duplicate rows. See
+ * specs/transcript-reconciliation-by-entry-id.md.
+ */
+function ensureMessageTranscriptEntryIdColumn(db: DatabaseSync): void {
+  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const hasTranscriptEntryId = messageColumns.some((col) => col.name === "transcript_entry_id");
+  if (!hasTranscriptEntryId) {
+    db.exec(`ALTER TABLE messages ADD COLUMN transcript_entry_id TEXT`);
+  }
+}
 
-  if (!hasForkBounded) {
-    db.exec(`ALTER TABLE conversation_bootstrap_state ADD COLUMN fork_bounded INTEGER NOT NULL DEFAULT 0`);
+/**
+ * Stable event-key deduplication: a stable identity for a message that survives
+ * across representations (e.g., transcript redacted vs. runtime unredacted).
+ * NULL for legacy rows; populated by `extractStableEventKey` at ingest time.
+ * The partial unique index `(conversation_id, stable_event_key) WHERE
+ * stable_event_key IS NOT NULL` enforces idempotency only for non-NULL keys.
+ */
+function ensureMessageStableEventKeyColumn(db: DatabaseSync): void {
+  const messageColumns = db.prepare(`PRAGMA table_info(messages)`).all() as SummaryColumnInfo[];
+  const hasStableEventKey = messageColumns.some((col) => col.name === "stable_event_key");
+  if (!hasStableEventKey) {
+    db.exec(`ALTER TABLE messages ADD COLUMN stable_event_key TEXT`);
   }
-  if (!hasForkSourceMessageCount) {
-    db.exec(
-      `ALTER TABLE conversation_bootstrap_state ADD COLUMN fork_source_message_count INTEGER NOT NULL DEFAULT 0`,
+}
+
+
+// Creates the durable trust boundary used by SQLite transcript migration.
+// Existing message transcript ids remain data, not trusted anchors, until a
+// later audit writes an explicit trust row or conversation epoch.
+function ensureTranscriptAnchorTrustTables(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS message_transcript_anchor_trust (
+      message_id INTEGER PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      transcript_entry_id TEXT,
+      trust_state TEXT NOT NULL CHECK (trust_state IN (
+        'verified', 'repaired', 'suspect', 'legacy_prefix', 'unproven'
+      )),
+      source TEXT NOT NULL,
+      reason TEXT,
+      verified_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
-  }
+
+    CREATE TABLE IF NOT EXISTS conversation_transcript_epochs (
+      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      session_key TEXT,
+      frontier_entry_id TEXT,
+      frontier_seq INTEGER,
+      frontier_created_at TEXT,
+      migration_mode TEXT NOT NULL CHECK (migration_mode IN (
+        'verified', 'repairable', 'legacy_prefix', 'corrupt'
+      )),
+      metadata_json TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS message_anchor_trust_conv_state_idx
+      ON message_transcript_anchor_trust (conversation_id, trust_state);
+    CREATE INDEX IF NOT EXISTS message_anchor_trust_conv_entry_idx
+      ON message_transcript_anchor_trust (conversation_id, transcript_entry_id)
+      WHERE transcript_entry_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS conversation_transcript_epochs_mode_idx
+      ON conversation_transcript_epochs (migration_mode, created_at);
+  `);
 }
 
 function backfillMessageIdentityHashes(
@@ -399,6 +550,67 @@ function backfillMessageIdentityHashes(
       }
       throw error;
     }
+    lastProcessedMessageId = rows[rows.length - 1]?.message_id ?? lastProcessedMessageId;
+  }
+}
+
+function buildLegacyRawMessageIdentityHash(role: string, content: string): string {
+  return createHash("sha256")
+    .update(role)
+    .update("\u0000")
+    .update(content)
+    .digest("hex");
+}
+
+function repairOpenClawMetadataIdentityState(db: DatabaseSync): void {
+  const selectStmt = db.prepare(
+    `SELECT message_id, conversation_id, role, content, identity_hash
+     FROM messages
+     WHERE message_id > ? AND role = 'user'
+     ORDER BY message_id
+     LIMIT ?`,
+  );
+  const updateIdentityStmt = db.prepare(
+    `UPDATE messages SET identity_hash = ? WHERE message_id = ?`,
+  );
+  let lastProcessedMessageId = 0;
+
+  while (true) {
+    const rows = selectStmt.all(
+      lastProcessedMessageId,
+      1_000,
+    ) as OpenClawMetadataIdentityRepairRow[];
+    if (rows.length === 0) {
+      return;
+    }
+
+    for (const row of rows) {
+      const canonicalContent = canonicalizeOpenClawInboundMetadataIdentityContent(
+        row.role,
+        row.content,
+      );
+      if (canonicalContent === row.content) {
+        continue;
+      }
+
+      const legacyMessageHash = buildLegacyRawMessageIdentityHash(row.role, row.content);
+      const previousCanonicalContent =
+        canonicalizeOpenClawInboundMetadataIdentityContentBeforeHistoryRecap(
+          row.role,
+          row.content,
+        );
+      const previousCanonicalMessageHash = buildLegacyRawMessageIdentityHash(
+        row.role,
+        previousCanonicalContent,
+      );
+      if (
+        row.identity_hash === legacyMessageHash ||
+        row.identity_hash === previousCanonicalMessageHash
+      ) {
+        updateIdentityStmt.run(buildMessageIdentityHash(row.role, row.content), row.message_id);
+      }
+    }
+
     lastProcessedMessageId = rows[rows.length - 1]?.message_id ?? lastProcessedMessageId;
   }
 }
@@ -937,6 +1149,7 @@ export function runLcmMigrations(
       session_key TEXT,
       active INTEGER NOT NULL DEFAULT 1,
       archived_at TEXT,
+      archive_cause TEXT,
       title TEXT,
       bootstrapped_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -951,8 +1164,39 @@ export function runLcmMigrations(
       content TEXT NOT NULL,
       token_count INTEGER NOT NULL,
       identity_hash TEXT,
+      openclaw_sender_metadata TEXT,
+      transcript_entry_id TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE (conversation_id, seq)
+    );
+
+    CREATE TABLE IF NOT EXISTS message_transcript_anchor_trust (
+      message_id INTEGER PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      transcript_entry_id TEXT,
+      trust_state TEXT NOT NULL CHECK (trust_state IN (
+        'verified', 'repaired', 'suspect', 'legacy_prefix', 'unproven'
+      )),
+      source TEXT NOT NULL,
+      reason TEXT,
+      verified_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS conversation_transcript_epochs (
+      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      session_key TEXT,
+      frontier_entry_id TEXT,
+      frontier_seq INTEGER,
+      frontier_created_at TEXT,
+      migration_mode TEXT NOT NULL CHECK (migration_mode IN (
+        'verified', 'repairable', 'legacy_prefix', 'corrupt'
+      )),
+      metadata_json TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
     CREATE TABLE IF NOT EXISTS summaries (
@@ -1043,22 +1287,12 @@ export function runLcmMigrations(
       file_name TEXT,
       mime_type TEXT,
       byte_size INTEGER,
+      line_count INTEGER,
       storage_uri TEXT NOT NULL,
       exploration_summary TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
-    CREATE TABLE IF NOT EXISTS conversation_bootstrap_state (
-      conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-      session_file_path TEXT NOT NULL,
-      last_seen_size INTEGER NOT NULL,
-      last_seen_mtime_ms INTEGER NOT NULL,
-      last_processed_offset INTEGER NOT NULL,
-      last_processed_entry_hash TEXT,
-      fork_bounded INTEGER NOT NULL DEFAULT 0,
-      fork_source_message_count INTEGER NOT NULL DEFAULT 0,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
 
     CREATE TABLE IF NOT EXISTS conversation_compaction_telemetry (
       conversation_id INTEGER PRIMARY KEY REFERENCES conversations(conversation_id) ON DELETE CASCADE,
@@ -1096,9 +1330,87 @@ export function runLcmMigrations(
       current_token_count INTEGER,
       projected_token_count INTEGER,
       raw_tokens_outside_tail INTEGER,
+      context_threshold REAL,
+      context_threshold_source TEXT,
+      context_fresh_tail_count INTEGER,
+      context_leaf_chunk_tokens INTEGER,
       retry_attempts INTEGER NOT NULL DEFAULT 0,
       next_attempt_after TEXT,
+      resolution_reason TEXT,
+      resolved_at TEXT,
+      maintenance_revision INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS pending_compaction_batches (
+      batch_id TEXT PRIMARY KEY,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      session_key TEXT,
+      session_target_json TEXT NOT NULL DEFAULT '{}',
+      status TEXT NOT NULL DEFAULT 'planning'
+        CHECK (status IN ('planning', 'ready', 'publishing', 'published', 'stale', 'failed')),
+      source_projection_fingerprint TEXT NOT NULL,
+      compactable_start_ordinal INTEGER NOT NULL,
+      compactable_end_ordinal INTEGER NOT NULL,
+      planned_fresh_tail_start_ordinal INTEGER,
+      prompt_version TEXT NOT NULL DEFAULT 'unknown',
+      model TEXT NOT NULL DEFAULT 'unknown',
+      failure_summary TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      published_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS pending_summary_nodes (
+      node_id TEXT PRIMARY KEY,
+      batch_id TEXT NOT NULL REFERENCES pending_compaction_batches(batch_id) ON DELETE CASCADE,
+      conversation_id INTEGER NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('leaf', 'condensed')),
+      depth INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'planned'
+        CHECK (status IN ('planned', 'running', 'ready', 'promoted', 'stale', 'failed')),
+      ordinal_start INTEGER NOT NULL,
+      ordinal_end INTEGER NOT NULL,
+      source_fingerprint TEXT NOT NULL,
+      source_context_hash TEXT,
+      content TEXT,
+      token_count INTEGER,
+      prompt_version TEXT NOT NULL DEFAULT 'unknown',
+      model TEXT NOT NULL DEFAULT 'unknown',
+      canonical_summary_id TEXT REFERENCES summaries(summary_id) ON DELETE SET NULL,
+      lease_owner TEXT,
+      lease_expires_at TEXT,
+      failure_summary TEXT,
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      next_attempt_after TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      ready_at TEXT,
+      promoted_at TEXT,
+      UNIQUE (batch_id, ordinal_start, ordinal_end, depth, kind),
+      CHECK (ordinal_end >= ordinal_start),
+      CHECK (token_count IS NULL OR token_count >= 0)
+    );
+
+    CREATE TABLE IF NOT EXISTS pending_summary_node_messages (
+      node_id TEXT NOT NULL REFERENCES pending_summary_nodes(node_id) ON DELETE CASCADE,
+      message_id INTEGER NOT NULL REFERENCES messages(message_id) ON DELETE RESTRICT,
+      ordinal INTEGER NOT NULL,
+      transcript_entry_id TEXT,
+      identity_hash TEXT,
+      PRIMARY KEY (node_id, message_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS pending_summary_node_children (
+      node_id TEXT NOT NULL REFERENCES pending_summary_nodes(node_id) ON DELETE CASCADE,
+      ordinal INTEGER NOT NULL,
+      child_node_id TEXT REFERENCES pending_summary_nodes(node_id) ON DELETE CASCADE,
+      child_summary_id TEXT REFERENCES summaries(summary_id) ON DELETE RESTRICT,
+      PRIMARY KEY (node_id, ordinal),
+      CHECK (
+        (child_node_id IS NOT NULL AND child_summary_id IS NULL) OR
+        (child_node_id IS NULL AND child_summary_id IS NOT NULL)
+      )
     );
 
     CREATE TABLE IF NOT EXISTS focus_briefs (
@@ -1138,8 +1450,26 @@ export function runLcmMigrations(
       PRIMARY KEY (step_name, algorithm_version)
     );
 
+    CREATE TABLE IF NOT EXISTS turn_advancements (
+      advancement_key TEXT PRIMARY KEY,
+      payload_hash TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      session_key TEXT,
+      admission_entry_id TEXT NOT NULL,
+      terminal_entry_id TEXT NOT NULL,
+      message_count INTEGER NOT NULL,
+      committed_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     -- Indexes
     CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ON messages (conversation_id, seq);
+    CREATE INDEX IF NOT EXISTS message_anchor_trust_conv_state_idx
+      ON message_transcript_anchor_trust (conversation_id, trust_state);
+    CREATE INDEX IF NOT EXISTS message_anchor_trust_conv_entry_idx
+      ON message_transcript_anchor_trust (conversation_id, transcript_entry_id)
+      WHERE transcript_entry_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS conversation_transcript_epochs_mode_idx
+      ON conversation_transcript_epochs (migration_mode, created_at);
     CREATE INDEX IF NOT EXISTS summaries_conv_created_idx ON summaries (conversation_id, created_at);
     CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);
     CREATE INDEX IF NOT EXISTS summary_parents_parent_summary_idx ON summary_parents (parent_summary_id);
@@ -1147,14 +1477,26 @@ export function runLcmMigrations(
     CREATE INDEX IF NOT EXISTS message_parts_type_idx ON message_parts (part_type);
     CREATE INDEX IF NOT EXISTS context_items_conv_idx ON context_items (conversation_id, ordinal);
     CREATE INDEX IF NOT EXISTS large_files_conv_idx ON large_files (conversation_id, created_at);
-    CREATE INDEX IF NOT EXISTS bootstrap_state_path_idx
-      ON conversation_bootstrap_state (session_file_path, updated_at);
     CREATE INDEX IF NOT EXISTS compaction_telemetry_state_idx
       ON conversation_compaction_telemetry (cache_state, updated_at);
+    CREATE INDEX IF NOT EXISTS pending_compaction_batches_conv_status_idx
+      ON pending_compaction_batches (conversation_id, status, created_at);
+    CREATE INDEX IF NOT EXISTS pending_summary_nodes_batch_status_idx
+      ON pending_summary_nodes (batch_id, status, ordinal_start);
+    CREATE INDEX IF NOT EXISTS pending_summary_nodes_conv_status_idx
+      ON pending_summary_nodes (conversation_id, status, ordinal_start);
+    CREATE INDEX IF NOT EXISTS pending_summary_node_messages_message_idx
+      ON pending_summary_node_messages (message_id);
+    CREATE INDEX IF NOT EXISTS pending_summary_node_children_child_node_idx
+      ON pending_summary_node_children (child_node_id);
+    CREATE INDEX IF NOT EXISTS pending_summary_node_children_child_summary_idx
+      ON pending_summary_node_children (child_summary_id);
     CREATE INDEX IF NOT EXISTS focus_briefs_conversation_status_idx
       ON focus_briefs (conversation_id, status, created_at);
     CREATE INDEX IF NOT EXISTS focus_brief_sources_summary_idx
       ON focus_brief_sources (summary_id);
+    CREATE INDEX IF NOT EXISTS turn_advancements_session_idx
+      ON turn_advancements (session_id, committed_at);
 
     -- Speed up summary_messages lookups by message_id (PK is summary_id,message_id)
     CREATE INDEX IF NOT EXISTS summary_messages_message_idx ON summary_messages (message_id);
@@ -1184,6 +1526,11 @@ export function runLcmMigrations(
       db.exec(`ALTER TABLE conversations ADD COLUMN archived_at TEXT`);
     }
 
+    const hasArchiveCause = conversationColumns.some((col) => col.name === "archive_cause");
+    if (!hasArchiveCause) {
+      db.exec(`ALTER TABLE conversations ADD COLUMN archive_cause TEXT`);
+    }
+
     db.exec(`UPDATE conversations SET active = 1 WHERE active IS NULL`);
     db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS conversations_active_session_key_idx
@@ -1207,23 +1554,55 @@ export function runLcmMigrations(
     runMigrationStep("ensureMessageIdentityHashColumn", log, () =>
       ensureMessageIdentityHashColumn(db),
     );
+    runMigrationStep("ensureMessageOpenClawSenderMetadataColumn", log, () =>
+      ensureMessageOpenClawSenderMetadataColumn(db),
+    );
     // v4.2 §B — messages.large_content sidecar column for stub-tier
     // stratification. Idempotent additive ALTER; safe across versions.
     runMigrationStep("ensureMessageLargeContentColumn", log, () =>
       ensureMessageLargeContentColumn(db),
     );
-    runMigrationStep("ensureConversationBootstrapStateForkColumns", log, () =>
-      ensureConversationBootstrapStateForkColumns(db),
-    );
+
     // Belt-and-suspenders: ensure message_parts exists even if the bulk
     // CREATE TABLE block above was interrupted before reaching it.
     runMigrationStep("ensureMessagePartsTable", log, () => ensureMessagePartsTable(db));
     runMigrationStep("backfillMessageIdentityHashes", log, () =>
       backfillMessageIdentityHashes(db, { managesOwnTransaction: false }),
     );
+    runVersionedBackfillStep(db, "repairOpenClawMetadataIdentityState", log, () =>
+      repairOpenClawMetadataIdentityState(db),
+    );
     runMigrationStep("createMessagesIdentityHashIndex", log, () =>
       db.exec(
         `CREATE INDEX IF NOT EXISTS messages_conv_identity_hash_idx ON messages (conversation_id, identity_hash)`,
+      ),
+    );
+    runMigrationStep("ensureMessageTranscriptEntryIdColumn", log, () =>
+      ensureMessageTranscriptEntryIdColumn(db),
+    );
+    runMigrationStep("ensureTranscriptAnchorTrustTables", log, () =>
+      ensureTranscriptAnchorTrustTables(db),
+    );
+    // Partial unique index: NULL entry ids (legacy rows, runtime ingests) are
+    // exempt, so this only enforces idempotency for transcript-imported rows.
+    runMigrationStep("createMessagesTranscriptEntryIdIndex", log, () =>
+      db.exec(
+        `CREATE UNIQUE INDEX IF NOT EXISTS messages_conv_entry_unique_idx
+         ON messages (conversation_id, transcript_entry_id)
+         WHERE transcript_entry_id IS NOT NULL`,
+      ),
+    );
+    runMigrationStep("ensureMessageStableEventKeyColumn", log, () =>
+      ensureMessageStableEventKeyColumn(db),
+    );
+    // Partial unique index: NULL stable event keys (legacy rows, messages
+    // without a stable identity) are exempt, so this only enforces idempotency
+    // for messages that carry a computed key.
+    runMigrationStep("createMessagesStableEventKeyIndex", log, () =>
+      db.exec(
+        `CREATE UNIQUE INDEX IF NOT EXISTS messages_stable_event_key_unique
+         ON messages (conversation_id, stable_event_key)
+         WHERE stable_event_key IS NOT NULL`,
       ),
     );
     runMigrationStep("ensureCompactionTelemetryColumns", log, () =>
@@ -1231,6 +1610,12 @@ export function runLcmMigrations(
     );
     runMigrationStep("ensureCompactionMaintenanceColumns", log, () =>
       ensureCompactionMaintenanceColumns(db),
+    );
+    runMigrationStep("ensureLargeFilesLineCountColumn", log, () =>
+      ensureLargeFilesLineCountColumn(db),
+    );
+    runMigrationStep("ensurePendingSummaryNodeRetryColumns", log, () =>
+      ensurePendingSummaryNodeRetryColumns(db),
     );
     runMigrationStep("ensureFocusBriefTables", log, () => ensureFocusBriefTables(db));
     runVersionedBackfillStep(db, "backfillSummaryDepths", log, () => backfillSummaryDepths(db));

@@ -4,13 +4,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi } from "../src/openclaw-bridge.js";
 import lcmPlugin from "../index.js";
 import { closeLcmConnection } from "../src/db/connection.js";
-import type { CompletionResult } from "../src/types.js";
+import type { CompletionResult, RuntimeCompactionDelegateFn } from "../src/types.js";
 
 type RegisteredEngineFactory = (() => unknown) | undefined;
 type RuntimeLlmComplete = ReturnType<typeof vi.fn>;
 
 function buildApi(params?: {
   runtimeLlmComplete?: RuntimeLlmComplete;
+  pluginConfig?: Record<string, unknown>;
 }): {
   api: OpenClawPluginApi;
   getFactory: () => RegisteredEngineFactory;
@@ -22,7 +23,7 @@ function buildApi(params?: {
     subagent: {
       run: vi.fn(),
       waitForRun: vi.fn(),
-      getSession: vi.fn(),
+      getSessionMessages: vi.fn(),
       deleteSession: vi.fn(),
     },
     config: {
@@ -48,6 +49,7 @@ function buildApi(params?: {
     pluginConfig: {
       enabled: true,
       dbPath,
+      ...(params?.pluginConfig ?? {}),
     },
     runtime,
     logger: {
@@ -88,6 +90,7 @@ function getRegisteredEngine(api: OpenClawPluginApi, getFactory: () => Registere
   }
   return factory() as {
     deps: {
+      delegateCompactionToRuntime?: RuntimeCompactionDelegateFn;
       complete: (input: {
         provider?: string;
         model: string;
@@ -105,6 +108,10 @@ function getRegisteredEngine(api: OpenClawPluginApi, getFactory: () => Registere
         temperature?: number;
         reasoningIfSupported?: string;
       }) => Promise<CompletionResult>;
+      resolveModel: (modelRef?: string, providerHint?: string) => {
+        provider: string;
+        model: string;
+      };
     };
     config: { databasePath: string };
   };
@@ -171,6 +178,50 @@ describe("createLcmDependencies.complete runtime.llm bridge", () => {
     }
   });
 
+  it("keeps ignored-session compaction safe when the host SDK delegate is unavailable", async () => {
+    const { api, getFactory, dbPath } = buildApi();
+    const engine = getRegisteredEngine(api, getFactory);
+
+    try {
+      const result = await engine.deps.delegateCompactionToRuntime?.({
+        sessionId: "runtime-ignored-session",
+        sessionKey: "agent:main:cron:nightly",
+        sessionFile: "/tmp/ignored.jsonl",
+        tokenBudget: 4096,
+      });
+
+      expect(result).toEqual({
+        ok: true,
+        compacted: false,
+        reason: "session excluded",
+      });
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+  });
+
+  it("resolves configured fallback provider candidates instead of the primary summary model", async () => {
+    const { api, getFactory, dbPath } = buildApi({
+      pluginConfig: {
+        summaryModel: "openai/gpt-5.5",
+        fallbackProviders: [{ provider: "minimax", model: "MiniMax-M2.7" }],
+      },
+    });
+    const engine = getRegisteredEngine(api, getFactory);
+
+    try {
+      expect(engine.deps.resolveModel("openai/gpt-5.5", "openai")).toEqual({
+        provider: "openai",
+        model: "gpt-5.5",
+      });
+      expect(engine.deps.resolveModel("minimax/MiniMax-M2.7", "minimax")).toEqual({
+        provider: "minimax",
+        model: "MiniMax-M2.7",
+      });
+    } finally {
+      closeLcmConnection(dbPath);
+    }
+  });
 
   it("omits agentId for plugin-wide runtime llm even when deps.complete receives one", async () => {
     const runtimeLlmComplete = vi.fn(async () => ({

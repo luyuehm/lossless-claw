@@ -10,6 +10,7 @@ import type { FocusBriefRecord, FocusBriefStore } from "./store/focus-brief-stor
 import type { SummaryStore, ContextItemRecord, SummaryRecord } from "./store/summary-store.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import { formatToolOutputReference } from "./large-files.js";
+import { serializeOpenClawSenderMetadata } from "./openclaw-sender-metadata.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 type AssemblySegment = "evictable" | "freshTail";
@@ -306,6 +307,60 @@ function getOriginalRole(parts: MessagePartRecord[]): string | null {
   return null;
 }
 
+type StoredModelIdentity = {
+  provider?: string;
+  api?: string;
+  model?: string;
+  responseModel?: string;
+};
+
+/** Read the assistant model identity persisted by buildMessageParts (if any). */
+function pickModelIdentity(parts: MessagePartRecord[]): StoredModelIdentity | undefined {
+  for (const part of parts) {
+    const decoded = parseJson(part.metadata);
+    if (!decoded || typeof decoded !== "object") {
+      continue;
+    }
+    const record = decoded as {
+      modelProvider?: unknown;
+      modelApi?: unknown;
+      modelId?: unknown;
+      responseModelId?: unknown;
+    };
+    const identity: StoredModelIdentity = {};
+    if (typeof record.modelProvider === "string" && record.modelProvider.length > 0) {
+      identity.provider = record.modelProvider;
+    }
+    if (typeof record.modelApi === "string" && record.modelApi.length > 0) {
+      identity.api = record.modelApi;
+    }
+    if (typeof record.modelId === "string" && record.modelId.length > 0) {
+      identity.model = record.modelId;
+    }
+    if (typeof record.responseModelId === "string" && record.responseModelId.length > 0) {
+      identity.responseModel = record.responseModelId;
+    }
+    // Mirror the ingest-side gate (extractModelIdentityMetadata): the host's
+    // same-model check needs provider+api+model all present. A partial
+    // identity must not qualify — it would preserve signatures the host then
+    // treats as cross-model (downgrade to text → response-channel
+    // contamination). responseModel remains supplemental.
+    if (
+      identity.provider !== undefined &&
+      identity.api !== undefined &&
+      identity.model !== undefined
+    ) {
+      return identity;
+    }
+  }
+  return undefined;
+}
+
+/** True when the part's message-level metadata carries a stored model identity. */
+function hasStoredModelIdentity(part: MessagePartRecord): boolean {
+  return pickModelIdentity([part]) !== undefined;
+}
+
 function getPartMetadata(part: MessagePartRecord): {
   originalRole?: string;
   rawType?: string;
@@ -533,8 +588,23 @@ function toRuntimeRole(
   return "user"; // user | system
 }
 
-/** @internal Exported for testing only. */
-export function blockFromPart(part: MessagePartRecord): unknown {
+/**
+ * Reconstruct a runtime content block from a stored message part.
+ *
+ * `messageHasStoredModelIdentity` is the message-level gate for preserving
+ * provider-issued thinking signatures (the host's transformMessages then
+ * applies its own same-model replay policy). Identity is persisted on
+ * ordinal-0 metadata only, so callers that reconstruct a whole message pass
+ * the message-level decision in; callers default to the per-part check so a
+ * standalone part still behaves correctly.
+ *
+ * @internal Exported for testing only.
+ */
+export function blockFromPart(
+  part: MessagePartRecord,
+  messageHasStoredModelIdentity?: boolean,
+): unknown {
+  const hasModelIdentity = messageHasStoredModelIdentity ?? hasStoredModelIdentity(part);
   const metadata = getPartMetadata(part);
   if (metadata.raw && typeof metadata.raw === "object") {
     // If this is an OpenClaw-normalised OpenAI reasoning block, restore the original
@@ -554,6 +624,34 @@ export function blockFromPart(part: MessagePartRecord): unknown {
       rawType === "thinking" &&
       typeof rawRecord.thinkingSignature === "string"
     ) {
+      // "reasoning_content" is OpenClaw's cross-provider sentinel signature
+      // (provider-stream stamps it for reasoning_content-native endpoints and
+      // the Anthropic client recognizes it), not a provider-issued signature.
+      // Preserving it keeps reasoning-native replay working when the assembled
+      // message also carries model identity (the host's transformMessages then
+      // treats the block as same-model and keeps the sentinel, which the
+      // Anthropic client drops from outgoing requests).
+      //
+      // Legacy rows without stored identity: drop the block entirely. The
+      // host's transformMessages would treat it as cross-model (missing
+      // identity → downgrade to text), which lands reasoning in the response
+      // channel of the chat template — exactly the contamination this patch
+      // fixes. Dropping mirrors what the host does to sentinel blocks without
+      // identity and avoids polluting the response channel for existing
+      // sessions that still have pre-upgrade rows.
+      if (rawRecord.thinkingSignature === "reasoning_content") {
+        return hasModelIdentity ? rawRecord : null;
+      }
+      // Provider-issued signatures are kept only when the stored model
+      // identity survives to the assembled message (the host's
+      // transformMessages then applies its own same-model replay policy).
+      // Identity lives on ordinal-0 metadata, so the gate is decided at
+      // message level and passed in; per-part check is the single-block
+      // fallback. Legacy rows without identity keep the historical strip so
+      // foreign signatures cannot leak across a provider switch (#365).
+      if (hasModelIdentity) {
+        return rawRecord;
+      }
       const { thinkingSignature: _thinkingSignature, ...cleaned } = rawRecord;
       return cleaned;
     }
@@ -676,7 +774,26 @@ export function contentFromParts(
     return fallbackContent;
   }
 
-  const blocks = contentParts.map(blockFromPart);
+  // Message-level signature-preservation gate: a signature-bearing thinking
+  // block may sit at any ordinal, but identity is persisted on ordinal-0
+  // metadata, so the decision must see the whole part set.
+  const messageHasStoredModelIdentity =
+    role === "assistant" && pickModelIdentity(parts) !== undefined;
+  const blocks = contentParts
+    .map((part) => blockFromPart(part, messageHasStoredModelIdentity))
+    .filter((block): block is NonNullable<typeof block> => block != null);
+  if (blocks.length === 0) {
+    // All content blocks were dropped (e.g. legacy sentinel-only thinking
+    // blocks without stored identity). Fall back to stored content like the
+    // no-parts branch above.
+    if (role === "assistant") {
+      return fallbackContent ? [{ type: "text", text: fallbackContent }] : [];
+    }
+    if (role === "toolResult") {
+      return [{ type: "text", text: fallbackContent }];
+    }
+    return fallbackContent;
+  }
   if (
     role === "user" &&
     blocks.length === 1 &&
@@ -1280,9 +1397,12 @@ function resolveFreshTailOrdinal(
   let protectedCount = 0;
   let protectedTokens = 0;
   let tailStartOrdinal = Infinity;
+  const latestUserOrdinal = rawMessages.findLast((item) => item.sourceRole === "user")?.ordinal;
 
   for (let idx = rawMessages.length - 1; idx >= 0; idx--) {
-    if (protectedCount >= freshTailCount) {
+    const latestUserProtected =
+      latestUserOrdinal === undefined || tailStartOrdinal <= latestUserOrdinal;
+    if (latestUserProtected && protectedCount >= freshTailCount) {
       break;
     }
 
@@ -1292,6 +1412,7 @@ function resolveFreshTailOrdinal(
     }
 
     const wouldExceedBudget =
+      latestUserProtected &&
       protectedCount > 0 &&
       typeof tokenCap === "number" &&
       protectedTokens + item.tokens > tokenCap;
@@ -1764,11 +1885,16 @@ export class ContextAssembler {
     const content = contentFromParts(parts, role, msg.content);
     const topLevelAssistantReasoning =
       role === "assistant" ? pickTopLevelAssistantReasoning(parts) : {};
+    const modelIdentity = role === "assistant" ? pickModelIdentity(parts) : undefined;
     const contentText =
       typeof content === "string" ? content : (JSON.stringify(content) ?? msg.content);
     const topLevelReasoningText = Object.values(topLevelAssistantReasoning).join("\n");
+    const senderMetadataText =
+      role === "user"
+        ? (serializeOpenClawSenderMetadata(msg.openClawSenderMetadata) ?? "")
+        : "";
     const tokenCount = estimateTokens(
-      [contentText, topLevelReasoningText].filter(Boolean).join("\n"),
+      [contentText, topLevelReasoningText, senderMetadataText].filter(Boolean).join("\n"),
     );
 
     // v4.2 §B (Option C) — `messages.large_content` now stores the
@@ -1800,6 +1926,7 @@ export class ContextAssembler {
           ? ({
               role,
               content,
+              ...(modelIdentity ?? {}),
               ...topLevelAssistantReasoning,
               usage: {
                 input: 0,
@@ -1819,6 +1946,9 @@ export class ContextAssembler {
           : ({
               role,
               content,
+              ...(role === "user" && msg.openClawSenderMetadata
+                ? { __openclaw: msg.openClawSenderMetadata }
+                : {}),
               ...(toolCallId ? { toolCallId } : {}),
               ...(toolName ? { toolName } : {}),
               ...(role === "toolResult" && toolIsError !== undefined ? { isError: toolIsError } : {}),

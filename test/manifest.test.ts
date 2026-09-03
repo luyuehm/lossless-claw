@@ -7,6 +7,7 @@ import manifest from "../openclaw.plugin.json" with { type: "json" };
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC_TOOLS_DIR = resolve(HERE, "..", "src", "tools");
 const PLUGIN_INDEX = resolve(HERE, "..", "src", "plugin", "index.ts");
+const PLUGIN_MANIFEST = resolve(HERE, "..", "openclaw.plugin.json");
 
 /**
  * These tests guard against drift between the names registered at runtime via
@@ -98,6 +99,10 @@ function extractRegisterToolFactoryCallSites(): RegisterToolFactoryCallSite[] {
   return sites.sort((a, b) => a.factory.localeCompare(b.factory));
 }
 describe("openclaw.plugin.json manifest drift guard (#570)", () => {
+  it("limits contracts to fields supported by the declared OpenClaw host", () => {
+    expect(Object.keys(manifest.contracts)).toEqual(["tools"]);
+  });
+
   it("contracts.tools matches the canonical name fields in src/tools/*", () => {
     const declared = [...manifest.contracts.tools].sort();
     const fromSource = extractToolNames();
@@ -130,9 +135,39 @@ describe("openclaw.plugin.json manifest drift guard (#570)", () => {
     expect(runtimeNames).toEqual(declared);
   });
 
+  it("exposes every recall tool through standard profiles as replay-safe", () => {
+    const declared = [...manifest.contracts.tools].sort();
+    const toolMetadata: Record<string, { profiles: string[]; replaySafe: boolean }> =
+      manifest.toolMetadata;
+
+    expect(Object.keys(toolMetadata).sort()).toEqual(declared);
+    for (const toolName of declared) {
+      expect(toolMetadata[toolName]).toEqual({
+        profiles: ["coding", "messaging", "full"],
+        replaySafe: true,
+      });
+    }
+  });
+
   it("declares startup activation until OpenClaw always loads selected context-engine plugins", () => {
     expect(manifest.name).toBe("Lossless Context Management");
     expect(manifest.kind).toBe("context-engine");
     expect(manifest.activation?.onStartup).toBe(true);
+  });
+
+  it("declares both supported runtime slash commands for lazy activation", () => {
+    expect(manifest.commandAliases).toEqual([
+      { name: "lossless", kind: "runtime-slash" },
+      { name: "lcm", kind: "runtime-slash" },
+    ]);
+  });
+
+  it("describes largeFilesDir relative to OPENCLAW_STATE_DIR without duplicate keys", () => {
+    const manifestSource = readFileSync(PLUGIN_MANIFEST, "utf8");
+    const largeFilesDirKeys = manifestSource.match(/^\s*"largeFilesDir"\s*:/gm) ?? [];
+
+    expect(largeFilesDirKeys).toHaveLength(2);
+    expect(manifest.uiHints.largeFilesDir?.help).toContain("OPENCLAW_STATE_DIR");
+    expect(manifest.configSchema.properties.largeFilesDir?.description).toContain("OPENCLAW_STATE_DIR");
   });
 });

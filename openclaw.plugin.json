@@ -1,11 +1,20 @@
 {
   "id": "lossless-claw",
-  "version": "0.12.1-fork.1",
   "name": "Lossless Context Management",
   "kind": "context-engine",
   "activation": {
     "onStartup": true
   },
+  "commandAliases": [
+    {
+      "name": "lossless",
+      "kind": "runtime-slash"
+    },
+    {
+      "name": "lcm",
+      "kind": "runtime-slash"
+    }
+  ],
   "skills": [
     "skills/lossless-claw"
   ],
@@ -17,14 +26,40 @@
       "lcm_expand_query"
     ]
   },
+  "toolMetadata": {
+    "lcm_grep": {
+      "profiles": ["coding", "messaging", "full"],
+      "replaySafe": true
+    },
+    "lcm_describe": {
+      "profiles": ["coding", "messaging", "full"],
+      "replaySafe": true
+    },
+    "lcm_expand": {
+      "profiles": ["coding", "messaging", "full"],
+      "replaySafe": true
+    },
+    "lcm_expand_query": {
+      "profiles": ["coding", "messaging", "full"],
+      "replaySafe": true
+    }
+  },
   "uiHints": {
     "enabled": {
       "label": "Enabled",
       "help": "Enable or disable lossless-claw without uninstalling it"
     },
+    "hostFallbackMode": {
+      "label": "Host Fallback Mode",
+      "help": "Controls the installation-wide agent-run host requirement. error (default) requires the full lifecycle and fails closed on CLI hosts. capture-only accepts bootstrap/after-turn/maintain so generic CLI runs keep transcript capture and recall without Lossless prompt assembly or host-triggered Lossless compaction. Backend-native compaction remains host-owned. Fully capable native hosts still run the full lifecycle. Subagent projection requirements are unchanged."
+    },
     "contextThreshold": {
       "label": "Context Threshold",
       "help": "Fraction of context window that triggers compaction (0.0–1.0)"
+    },
+    "contextThresholdOverrides": {
+      "label": "Context Threshold Overrides",
+      "help": "Optional ordered rules that override contextThreshold, freshTailCount, and leafChunkTokens by model, model context-window range, or session glob pattern"
     },
     "sweepMaxDepth": {
       "label": "Sweep Max Depth",
@@ -40,7 +75,7 @@
     },
     "freshTailMaxTokens": {
       "label": "Fresh Tail Max Tokens",
-      "help": "Optional token cap for the protected fresh tail; the newest message is always preserved"
+      "help": "Optional token cap for the protected fresh tail; the newest user message and its following assistant/tool suffix are always preserved"
     },
     "promptAwareEviction": {
       "label": "Prompt-Aware Eviction",
@@ -112,11 +147,7 @@
     },
     "largeFilesDir": {
       "label": "Large Files Directory",
-      "help": "Directory for persisting large-file text payloads (default: <stateDir>/lcm-files). Uses OPENCLAW_STATE_DIR when set."
-    },
-    "largeFilesDir": {
-      "label": "Large Files Directory",
-      "help": "Directory for externalized large files and inline-image payloads (default: ~/.openclaw/lcm-files)"
+      "help": "Directory for persisting externalized large-file text and inline-image payloads (default: <OPENCLAW_STATE_DIR>/lcm-files)"
     },
     "ignoreSessionPatterns": {
       "label": "Ignored Sessions",
@@ -164,7 +195,7 @@
     },
     "delegationTimeoutMs": {
       "label": "Delegation Timeout (ms)",
-      "help": "Maximum time to wait for delegated lcm_expand_query sub-agent completion before timing out"
+      "help": "Wall-clock budget shared by delegated work in one lcm_expand_query call; the tool keeps 30 seconds of RPC headroom for cancellation and cleanup"
     },
     "summaryTimeoutMs": {
       "label": "Summary Timeout (ms)",
@@ -189,6 +220,10 @@
     "summaryMaxOverageFactor": {
       "label": "Summary Max Overage Factor",
       "help": "Maximum allowed overage factor for summaries relative to target tokens (default 3). Summaries exceeding this are deterministically truncated."
+    },
+    "fallbackMaxTokens": {
+      "label": "Fallback Max Tokens",
+      "help": "Maximum token budget for deterministic fallback summaries when the LLM summarizer fails (default 512, minimum 64)"
     },
     "customInstructions": {
       "label": "Custom Instructions",
@@ -255,8 +290,28 @@
       "help": "Retroactively delete HEARTBEAT_OK turn cycles from LCM storage"
     },
     "transcriptGcEnabled": {
-      "label": "Transcript GC",
-      "help": "Enable transcript rewrite GC during maintain(); disabled by default"
+      "label": "Transcript GC (Retired)",
+      "help": "Accepted for upgrade compatibility and ignored. OpenClaw owns active transcript storage in Lossless Claw 1.x."
+    },
+    "autoRotateSessionFiles.enabled": {
+      "label": "Auto-Rotate Session Files (Retired)",
+      "help": "Accepted for upgrade compatibility and ignored. OpenClaw owns active session-file rotation in Lossless Claw 1.x."
+    },
+    "autoRotateSessionFiles.createBackups": {
+      "label": "Auto-Rotate Backups (Retired)",
+      "help": "Accepted for upgrade compatibility and ignored."
+    },
+    "autoRotateSessionFiles.sizeBytes": {
+      "label": "Auto-Rotate Size Bytes (Retired)",
+      "help": "Accepted for upgrade compatibility and ignored."
+    },
+    "autoRotateSessionFiles.startup": {
+      "label": "Startup Auto-Rotate (Retired)",
+      "help": "Accepted for upgrade compatibility and ignored."
+    },
+    "autoRotateSessionFiles.runtime": {
+      "label": "Runtime Auto-Rotate (Retired)",
+      "help": "Accepted for upgrade compatibility and ignored."
     },
     "enableSummaryThinking": {
       "label": "Enable Summary Thinking",
@@ -265,26 +320,6 @@
     "proactiveThresholdCompactionMode": {
       "label": "Proactive Threshold Compaction Mode",
       "help": "Choose deferred compaction debt by default or keep legacy inline proactive compaction"
-    },
-    "autoRotateSessionFiles.enabled": {
-      "label": "Auto-Rotate Session Files",
-      "help": "Automatically rotate oversized LCM-managed session JSONL files after startup and runtime checks"
-    },
-    "autoRotateSessionFiles.createBackups": {
-      "label": "Auto-Rotate Backups",
-      "help": "Create the rolling rotate-latest SQLite backup before automatic session-file rotation; disabled by default"
-    },
-    "autoRotateSessionFiles.sizeBytes": {
-      "label": "Auto-Rotate Size Bytes",
-      "help": "Session JSONL byte threshold for automatic rotation (default: 2097152)"
-    },
-    "autoRotateSessionFiles.startup": {
-      "label": "Startup Auto-Rotate",
-      "help": "Startup behavior for oversized indexed OpenClaw session files with active LCM state: rotate, warn, or off"
-    },
-    "autoRotateSessionFiles.runtime": {
-      "label": "Runtime Auto-Rotate",
-      "help": "Runtime behavior for oversized current LCM session files: rotate, warn, or off"
     },
     "independentLogFile.enabled": {
       "label": "Independent Log File",
@@ -314,10 +349,66 @@
       "enabled": {
         "type": "boolean"
       },
+      "hostFallbackMode": {
+        "type": "string",
+        "enum": ["error", "capture-only"]
+      },
       "contextThreshold": {
         "type": "number",
         "minimum": 0,
         "maximum": 1
+      },
+      "contextThresholdOverrides": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "match",
+            "contextThreshold"
+          ],
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "match": {
+              "type": "object",
+              "additionalProperties": false,
+              "minProperties": 1,
+              "properties": {
+                "model": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "modelContextWindowMin": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "modelContextWindowMax": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "sessionPattern": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "contextThreshold": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "freshTailCount": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "leafChunkTokens": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
       },
       "sweepMaxDepth": {
         "type": "integer",
@@ -396,9 +487,6 @@
       "dbPath": {
         "type": "string"
       },
-      "largeFilesDir": {
-        "type": "string"
-      },
       "ignoreSessionPatterns": {
         "type": "array",
         "items": {
@@ -467,6 +555,10 @@
       "summaryMaxOverageFactor": {
         "type": "number",
         "minimum": 1
+      },
+      "fallbackMaxTokens": {
+        "type": "integer",
+        "minimum": 64
       },
       "customInstructions": {
         "type": "string"
@@ -542,19 +634,11 @@
         "type": "boolean"
       },
       "transcriptGcEnabled": {
+        "description": "Retired compatibility setting. Lossless Claw 1.x accepts and ignores this value.",
         "type": "boolean"
-      },
-      "enableSummaryThinking": {
-        "type": "boolean"
-      },
-      "proactiveThresholdCompactionMode": {
-        "type": "string",
-        "enum": [
-          "deferred",
-          "inline"
-        ]
       },
       "autoRotateSessionFiles": {
+        "description": "Retired compatibility setting. Lossless Claw 1.x accepts and ignores these values.",
         "type": "object",
         "additionalProperties": false,
         "properties": {
@@ -570,21 +654,23 @@
           },
           "startup": {
             "type": "string",
-            "enum": [
-              "rotate",
-              "warn",
-              "off"
-            ]
+            "enum": ["rotate", "warn", "off"]
           },
           "runtime": {
             "type": "string",
-            "enum": [
-              "rotate",
-              "warn",
-              "off"
-            ]
+            "enum": ["rotate", "warn", "off"]
           }
         }
+      },
+      "enableSummaryThinking": {
+        "type": "boolean"
+      },
+      "proactiveThresholdCompactionMode": {
+        "type": "string",
+        "enum": [
+          "deferred",
+          "inline"
+        ]
       },
       "independentLogFile": {
         "type": "object",
@@ -607,7 +693,7 @@
         "type": "string"
       },
       "largeFilesDir": {
-        "description": "Directory for persisting large-file text payloads (default: <OPENCLAW_STATE_DIR>/lcm-files)",
+        "description": "Directory for persisting externalized large-file text and inline-image payloads (default: <OPENCLAW_STATE_DIR>/lcm-files)",
         "type": "string"
       },
       "fallbackProviders": {

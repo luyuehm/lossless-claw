@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -27,11 +28,16 @@ const (
 	defaultLLMProvider     = "anthropic"
 	anthropicModel         = "claude-sonnet-4-20250514"
 	anthropicVersion       = "2023-06-01"
+	miniMaxProviderID      = "minimax"
+	miniMaxCNProviderID    = "minimax-cn"
+	miniMaxModel           = "MiniMax-M3"
 	openAIResponsesModel   = "gpt-5.3-codex"
 	condensedTargetTokens  = 2000
 	defaultHTTPTimeout     = 180 * time.Second
 
 	defaultAnthropicBaseURL = "https://api.anthropic.com"
+	defaultMiniMaxBaseURL   = "https://api.minimax.io/anthropic"
+	defaultMiniMaxCNBaseURL = "https://api.minimaxi.com/anthropic"
 	defaultOpenAIBaseURL    = "https://api.openai.com"
 )
 
@@ -40,6 +46,8 @@ var (
 	execCLICommand      = exec.CommandContext
 	cliOutputTokenSlack = 128
 )
+
+const cliOutputMaxOverageFactor = 3
 
 // cliSummarizationSystemPrompt is the system directive sent to CLI-delegated
 // summarizers (claude CLI, codex CLI). It constrains the CLI to output only
@@ -107,7 +115,7 @@ type anthropicClient struct {
 type anthropicRequest struct {
 	Model       string                    `json:"model"`
 	MaxTokens   int                       `json:"max_tokens"`
-	Temperature float64                   `json:"temperature,omitempty"`
+	Temperature *float64                  `json:"temperature,omitempty"`
 	Messages    []anthropicRequestMessage `json:"messages"`
 }
 
@@ -969,6 +977,8 @@ func (c *anthropicClient) summarize(ctx context.Context, prompt string, targetTo
 	switch provider {
 	case "anthropic":
 		return c.summarizeAnthropic(ctx, model, prompt, targetTokens)
+	case miniMaxProviderID, miniMaxCNProviderID:
+		return c.summarizeMiniMax(ctx, model, prompt, targetTokens)
 	case "openai", "openai-codex", "github-copilot":
 		return c.summarizeOpenAI(ctx, model, prompt, targetTokens)
 	default:
@@ -980,7 +990,7 @@ func (c *anthropicClient) summarizeAnthropic(ctx context.Context, model, prompt 
 	reqBody := anthropicRequest{
 		Model:       model,
 		MaxTokens:   targetTokens,
-		Temperature: 0,
+		Temperature: zeroTemperature(),
 		Messages: []anthropicRequestMessage{
 			{Role: "user", Content: prompt},
 		},
@@ -1048,6 +1058,76 @@ func (c *anthropicClient) summarizeAnthropic(ctx context.Context, model, prompt 
 	return result, nil
 }
 
+func (c *anthropicClient) summarizeMiniMax(ctx context.Context, model, prompt string, targetTokens int) (string, error) {
+	reqBody := anthropicRequest{
+		Model:       model,
+		MaxTokens:   targetTokens,
+		Temperature: zeroTemperature(),
+		Messages: []anthropicRequestMessage{
+			{Role: "user", Content: prompt},
+		},
+	}
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal MiniMax request: %w", err)
+	}
+
+	baseURL := c.baseURL
+	if baseURL == "" {
+		baseURL = defaultMiniMaxBaseURLForProvider(c.provider)
+	}
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		resolveProviderEndpointURL(baseURL, "/v1/messages"),
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		return "", fmt.Errorf("build MiniMax request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("anthropic-version", anthropicVersion)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("call MiniMax API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read MiniMax response: %w", err)
+	}
+
+	if resp.StatusCode >= 300 {
+		var apiErr anthropicErrorEnvelope
+		if json.Unmarshal(body, &apiErr) == nil && strings.TrimSpace(apiErr.Error.Message) != "" {
+			return "", fmt.Errorf("MiniMax API %d %s: %s", resp.StatusCode, apiErr.Error.Type, apiErr.Error.Message)
+		}
+		return "", fmt.Errorf("MiniMax API %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	result, blockTypes, err := extractMiniMaxSummary(body)
+	if err != nil {
+		return "", err
+	}
+	if result == "" {
+		return "", fmt.Errorf(
+			"empty summary after normalization (provider=%s model=%s block_types=%s)",
+			normalizeProviderID(c.provider),
+			model,
+			formatBlockTypes(blockTypes),
+		)
+	}
+	return result, nil
+}
+
+func zeroTemperature() *float64 {
+	value := 0.0
+	return &value
+}
+
 // summarizeViaCLI delegates to the `claude` CLI binary when an OAuth/setup-token
 // is in use. The CLI handles Max OAuth exchange internally, so no raw API key is needed.
 func summarizeViaCLI(ctx context.Context, model, prompt string, targetTokens int) (string, error) {
@@ -1082,16 +1162,9 @@ func summarizeViaCLI(ctx context.Context, model, prompt string, targetTokens int
 		return "", fmt.Errorf("claude CLI: %w", err)
 	}
 	result := strings.TrimSpace(string(out))
-	if result == "" {
-		return "", fmt.Errorf("claude CLI returned empty output")
-	}
-	estimatedTokens := estimateTokenCount(result)
-	if estimatedTokens > targetTokens+cliOutputTokenSlack {
-		return "", fmt.Errorf(
-			"claude CLI output exceeded target token budget: got %d tokens for target %d",
-			estimatedTokens,
-			targetTokens,
-		)
+	result, err = normalizeCLISummaryOutput("claude", result, targetTokens)
+	if err != nil {
+		return "", err
 	}
 	return result, nil
 }
@@ -1176,18 +1249,72 @@ func summarizeViaCodexCLI(ctx context.Context, model, prompt string, targetToken
 		return "", fmt.Errorf("read codex CLI output: %w", err)
 	}
 	result := strings.TrimSpace(string(data))
-	if result == "" {
-		return "", fmt.Errorf("codex CLI returned empty output")
-	}
-	estimatedTokens := estimateTokenCount(result)
-	if estimatedTokens > targetTokens+cliOutputTokenSlack {
-		return "", fmt.Errorf(
-			"codex CLI output exceeded target token budget: got %d tokens for target %d",
-			estimatedTokens,
-			targetTokens,
-		)
+	result, err = normalizeCLISummaryOutput("codex", result, targetTokens)
+	if err != nil {
+		return "", err
 	}
 	return result, nil
+}
+
+func normalizeCLISummaryOutput(cliName, result string, targetTokens int) (string, error) {
+	result = strings.TrimSpace(result)
+	if result == "" {
+		return "", fmt.Errorf("%s CLI returned empty output", cliName)
+	}
+	if targetTokens <= 0 {
+		return result, nil
+	}
+
+	estimatedTokens := estimateTokenCount(result)
+	maxTokens := targetTokens * cliOutputMaxOverageFactor
+	if slackLimit := targetTokens + cliOutputTokenSlack; slackLimit > maxTokens {
+		maxTokens = slackLimit
+	}
+	if estimatedTokens <= maxTokens {
+		return result, nil
+	}
+	return capSummaryText(result, estimatedTokens, maxTokens), nil
+}
+
+func capSummaryText(content string, originalTokens, maxTokens int) string {
+	suffixes := []string{
+		fmt.Sprintf("\n[Capped from %d tokens to ~%d]", originalTokens, maxTokens),
+		fmt.Sprintf("\n[Capped to ~%d]", maxTokens),
+		"\n[Capped]",
+		"",
+	}
+
+	for _, suffix := range suffixes {
+		contentBudget := maxTokens - estimateTokenCount(suffix)
+		if contentBudget < 0 {
+			contentBudget = 0
+		}
+		capped := truncateTextToEstimatedTokens(content, contentBudget) + suffix
+		if estimateTokenCount(capped) <= maxTokens {
+			return strings.TrimSpace(capped)
+		}
+	}
+
+	return truncateTextToEstimatedTokens(content, maxTokens)
+}
+
+func truncateTextToEstimatedTokens(content string, maxTokens int) string {
+	content = strings.TrimSpace(content)
+	if maxTokens <= 0 || content == "" {
+		return ""
+	}
+	maxChars := maxTokens * 4
+	if len(content) <= maxChars {
+		return content
+	}
+	cut := maxChars
+	for cut > 0 && !utf8.RuneStart(content[cut]) {
+		cut--
+	}
+	if cut <= 0 {
+		return ""
+	}
+	return strings.TrimSpace(content[:cut])
 }
 
 func (c *anthropicClient) summarizeOpenAI(ctx context.Context, model, prompt string, targetTokens int) (string, error) {
@@ -1270,9 +1397,17 @@ func (c *anthropicClient) summarizeOpenAI(ctx context.Context, model, prompt str
 }
 
 func extractAnthropicSummary(body []byte) (string, []string, error) {
+	return extractMessagesSummary("Anthropic", body)
+}
+
+func extractMiniMaxSummary(body []byte) (string, []string, error) {
+	return extractMessagesSummary("MiniMax", body)
+}
+
+func extractMessagesSummary(apiName string, body []byte) (string, []string, error) {
 	var parsed anthropicResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", nil, fmt.Errorf("decode Anthropic response: %w", err)
+		return "", nil, fmt.Errorf("decode %s response: %w", apiName, err)
 	}
 
 	chunks := make([]string, 0, len(parsed.Content))
@@ -1429,9 +1564,12 @@ func resolveSummaryProviderModel(providerHint, modelHint string) (string, string
 	model := strings.TrimSpace(modelHint)
 
 	if model == "" {
-		if provider == "openai" || provider == "openai-codex" || provider == "github-copilot" {
+		switch provider {
+		case miniMaxProviderID, miniMaxCNProviderID:
+			model = miniMaxModel
+		case "openai", "openai-codex", "github-copilot":
 			model = openAIResponsesModel
-		} else {
+		default:
 			model = anthropicModel
 		}
 	}
@@ -1460,6 +1598,8 @@ func normalizeProviderID(provider string) string {
 func inferProviderFromModel(model string) string {
 	lower := strings.ToLower(strings.TrimSpace(model))
 	switch {
+	case strings.HasPrefix(lower, miniMaxProviderID+"-"):
+		return miniMaxProviderID
 	case strings.HasPrefix(lower, "claude"):
 		return "anthropic"
 	case strings.HasPrefix(lower, "gpt-"),
@@ -1622,6 +1762,8 @@ func providerAPIEnvCandidates(provider string) []string {
 	switch normalizeProviderID(provider) {
 	case "anthropic":
 		return []string{"ANTHROPIC_API_KEY"}
+	case miniMaxProviderID, miniMaxCNProviderID:
+		return []string{"MINIMAX_API_KEY"}
 	case "openai", "openai-codex":
 		return []string{"OPENAI_API_KEY"}
 	case "github-copilot":
@@ -1697,11 +1839,20 @@ func resolveProviderBaseURL(paths appDataPaths, provider, flagOverride string) s
 	}
 
 	switch normalizedProvider {
+	case miniMaxProviderID, miniMaxCNProviderID:
+		return defaultMiniMaxBaseURLForProvider(normalizedProvider)
 	case "openai", "openai-codex", "github-copilot":
 		return defaultOpenAIBaseURL
 	default:
 		return defaultAnthropicBaseURL
 	}
+}
+
+func defaultMiniMaxBaseURLForProvider(provider string) string {
+	if normalizeProviderID(provider) == miniMaxCNProviderID {
+		return defaultMiniMaxCNBaseURL
+	}
+	return defaultMiniMaxBaseURL
 }
 
 // resolveProviderEndpointURL accepts either API-root base URLs or versioned /v1 URLs.

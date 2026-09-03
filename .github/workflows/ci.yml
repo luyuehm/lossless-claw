@@ -26,8 +26,35 @@ jobs:
       - name: Run typecheck
         run: npm run typecheck
 
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: tui/go.mod
+          cache-dependency-path: tui/go.sum
+
+      - name: Run TUI tests
+        run: npm run test:tui
+
       - name: Run tests
-        run: npm test
+        run: |
+          set +e
+          npx vitest run --dir test --reporter=json --outputFile=vitest-results.json
+          test_status=$?
+          node --input-type=module <<'EOF'
+          import fs from "node:fs";
+          const clean = (value) => String(value ?? "").replace(/[^\x09\x0A\x0D\x20-\x7E]/g, "?");
+          const report = JSON.parse(fs.readFileSync("vitest-results.json", "utf8"));
+          console.log(`tests: ${report.numPassedTests}/${report.numTotalTests} passed; files: ${report.numPassedTestSuites}/${report.numTotalTestSuites} passed`);
+          for (const suite of report.testResults ?? []) {
+            for (const assertion of suite.assertionResults ?? []) {
+              if (assertion.status === "failed") {
+                console.log(`failed: ${clean(assertion.fullName)}`);
+                for (const message of assertion.failureMessages ?? []) console.log(clean(message));
+              }
+            }
+          }
+          EOF
+          exit $test_status
 
   plugin-inspector:
     runs-on: ubuntu-latest
