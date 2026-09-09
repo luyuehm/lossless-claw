@@ -535,6 +535,19 @@ export class LcmContextEngine implements ContextEngine {
   >();
   private deferredCompactionDrains = new Set<string>();
   private pendingSummaryPreparationDrains = new Set<string>();
+  /**
+   * Tracks consecutive no-progress pending-summary drains per session queue.
+   *
+   * The idle drain re-schedules itself via `setImmediate` whenever the pending
+   * compaction coordinator reports `pending: true` outside the guarded reasons.
+   * When a session is stuck in a non-converging state (e.g. a rebounded or
+   * stale frontier that keeps yielding `pending summary work remains`), that
+   * becomes a hot `setImmediate` loop that pins the Node event loop at ~100%
+   * CPU and starves the host agent. This counter backs off the re-schedule and
+   * eventually stops it, so convergence is re-attempted by the next user turn
+   * or host `maintain()` instead of spinning forever.
+   */
+  private pendingSummaryDrainStallCounts = new Map<string, number>();
   private previousAssembledMessagesByConversation = new Map<number, AssemblePrefixSnapshot>();
   private recentBootstrapImportsByConversation = new Map<number, BootstrapImportObservation>();
   private deps: LcmDependencies;
@@ -1074,6 +1087,60 @@ export class LcmContextEngine implements ContextEngine {
     });
   }
 
+  /**
+   * Re-schedule a pending-summary drain after a non-converging pass, backing
+   * off instead of spinning `setImmediate` forever.
+   *
+   * Returns false when the session has stalled past the hard limit and the
+   * drain should stop until the next user turn or host `maintain()`.
+   */
+  private reschedulePendingSummaryDrainWithBackoff(
+    params: PendingSummaryPreparationDrainParams,
+    queueKey: string,
+  ): boolean {
+    const stallCount = (this.pendingSummaryDrainStallCounts.get(queueKey) ?? 0) + 1;
+    this.pendingSummaryDrainStallCounts.set(queueKey, stallCount);
+
+    // Beyond this many consecutive no-progress drains, stop re-scheduling.
+    // Convergence is re-attempted by the next user turn or maintain().
+    const HARD_LIMIT = 8;
+    if (stallCount >= HARD_LIMIT) {
+      this.pendingSummaryDrainStallCounts.delete(queueKey);
+      this.deps.log.warn(
+        `[lcm] pending summary drain stalled conversation=${params.conversationId} ${formatSessionLabel(params.sessionId, params.sessionKey)} stalls=${stallCount}; deferring to next turn/maintain`,
+      );
+      return false;
+    }
+
+    // Exponential backoff: 0ms, 50ms, 100ms, 200ms, 400ms, 800ms, 1600ms, then
+    // the hard limit fires. Keeping the first couple of retries immediate avoids
+    // slowing down the common "a few steps remain" case, while the backoff
+    // breaks the hot loop when a session can never converge.
+    const delayMs = stallCount <= 2 ? 0 : Math.min(1600, 50 * 2 ** (stallCount - 3));
+    if (delayMs === 0) {
+      setImmediate(() => {
+        void this.drainPendingSummaryPreparationIfIdle({ ...params, queueKey }).catch(
+          (err) => {
+            this.deps.log.warn(
+              `[lcm] background pending summary preparation failed conversation=${params.conversationId} session=${params.sessionId}: ${describeLogError(err)}`,
+            );
+          },
+        );
+      });
+    } else {
+      setTimeout(() => {
+        void this.drainPendingSummaryPreparationIfIdle({ ...params, queueKey }).catch(
+          (err) => {
+            this.deps.log.warn(
+              `[lcm] background pending summary preparation failed conversation=${params.conversationId} session=${params.sessionId}: ${describeLogError(err)}`,
+            );
+          },
+        );
+      }, delayMs);
+    }
+    return true;
+  }
+
   /** Advance below-threshold pending summary preparation only when the session is idle. */
   private async drainPendingSummaryPreparationIfIdle(
     params: PendingSummaryPreparationDrainParams & { queueKey: string },
@@ -1130,7 +1197,11 @@ export class LcmContextEngine implements ContextEngine {
         result.reason !== "circuit breaker open" &&
         result.reason !== PENDING_SUMMARY_MODEL_UNAVAILABLE_REASON
       ) {
-        this.schedulePendingSummaryPreparationDrain(params);
+        this.reschedulePendingSummaryDrainWithBackoff(params, params.queueKey);
+      } else {
+        // Progress or a guarded terminal reason: reset the stall counter so a
+        // later genuine stall is measured from zero again.
+        this.pendingSummaryDrainStallCounts.delete(params.queueKey);
       }
     } finally {
       this.pendingSummaryPreparationDrains.delete(params.queueKey);
