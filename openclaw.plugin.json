@@ -28,19 +28,35 @@
   },
   "toolMetadata": {
     "lcm_grep": {
-      "profiles": ["coding", "messaging", "full"],
+      "profiles": [
+        "coding",
+        "messaging",
+        "full"
+      ],
       "replaySafe": true
     },
     "lcm_describe": {
-      "profiles": ["coding", "messaging", "full"],
+      "profiles": [
+        "coding",
+        "messaging",
+        "full"
+      ],
       "replaySafe": true
     },
     "lcm_expand": {
-      "profiles": ["coding", "messaging", "full"],
+      "profiles": [
+        "coding",
+        "messaging",
+        "full"
+      ],
       "replaySafe": true
     },
     "lcm_expand_query": {
-      "profiles": ["coding", "messaging", "full"],
+      "profiles": [
+        "coding",
+        "messaging",
+        "full"
+      ],
       "replaySafe": true
     }
   },
@@ -351,7 +367,10 @@
       },
       "hostFallbackMode": {
         "type": "string",
-        "enum": ["error", "capture-only"]
+        "enum": [
+          "error",
+          "capture-only"
+        ]
       },
       "contextThreshold": {
         "type": "number",
@@ -654,11 +673,19 @@
           },
           "startup": {
             "type": "string",
-            "enum": ["rotate", "warn", "off"]
+            "enum": [
+              "rotate",
+              "warn",
+              "off"
+            ]
           },
           "runtime": {
             "type": "string",
-            "enum": ["rotate", "warn", "off"]
+            "enum": [
+              "rotate",
+              "warn",
+              "off"
+            ]
           }
         }
       },
@@ -701,10 +728,17 @@
         "items": {
           "type": "object",
           "properties": {
-            "provider": { "type": "string" },
-            "model": { "type": "string" }
+            "provider": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
           },
-          "required": ["provider", "model"],
+          "required": [
+            "provider",
+            "model"
+          ],
           "additionalProperties": false
         }
       },
@@ -714,6 +748,10 @@
         "items": {
           "type": "string"
         }
+      },
+      "durableAdvancement": {
+        "type": "boolean",
+        "description": "When false, suppress the atomic-idempotent-v1 durable turn advancement declaration in engine.info, bypassing host outbox writes and crash recovery deadlocks."
       }
     }
   }

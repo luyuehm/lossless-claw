@@ -623,7 +623,9 @@ export class LcmContextEngine implements ContextEngine {
       acceptedHostParams: ["sessionKey", "prompt", "runtimeContext", "runtimeSettings"],
       transcriptSemantics: {
         currentTurnFence: "before-current-turn-entry-v1",
-        turnAdvancementIdempotency: "atomic-idempotent-v1",
+        ...(this.config.durableAdvancement !== false
+          ? { turnAdvancementIdempotency: "atomic-idempotent-v1" as const }
+          : {}),
       },
       ownsCompaction: migrationOk,
       turnMaintenanceMode: "background",

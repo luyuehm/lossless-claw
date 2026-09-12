@@ -53,6 +53,14 @@ describe("LcmContextEngine metadata", () => {
     });
   });
 
+  it("omits turnAdvancementIdempotency when durableAdvancement is false", () => {
+    const engine = createEngineWithConfig({ durableAdvancement: false });
+    expect(engine.info.transcriptSemantics).toEqual({
+      currentTurnFence: "before-current-turn-entry-v1",
+    });
+    expect(engine.info.transcriptSemantics?.turnAdvancementIdempotency).toBeUndefined();
+  });
+
   it("advertises ownsCompaction capability", () => {
     const engine = createEngine();
     expect(engine.info.ownsCompaction).toBe(true);

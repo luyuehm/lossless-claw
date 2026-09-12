@@ -1060,6 +1060,20 @@ describe("resolveLcmConfig", () => {
     });
     expect(config.fallbackMaxTokens).toBe(2048);
   });
+
+  it("defaults durableAdvancement to true and allows disabling via config or env", () => {
+    const defaultConfig = resolveLcmConfig({}, {});
+    expect(defaultConfig.durableAdvancement).toBe(true);
+
+    const disabledConfig = resolveLcmConfig({}, { durableAdvancement: false });
+    expect(disabledConfig.durableAdvancement).toBe(false);
+
+    const envDisabled = resolveLcmConfig(
+      { LCM_DURABLE_ADVANCEMENT: "false" } as NodeJS.ProcessEnv,
+      { durableAdvancement: true },
+    );
+    expect(envDisabled.durableAdvancement).toBe(false);
+  });
 });
 
 describe("resolveOpenclawStateDir", () => {

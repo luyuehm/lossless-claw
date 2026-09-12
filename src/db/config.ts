@@ -167,6 +167,14 @@ export type LcmConfig = {
   enableSummaryThinking: boolean;
   /** Controls whether proactive threshold compaction runs inline or is deferred. */
   proactiveThresholdCompactionMode: ProactiveThresholdCompactionMode;
+  /**
+   * When false, suppress the "atomic-idempotent-v1" turnAdvancementIdempotency
+   * declaration in engine.info. This disables OpenClaw's durable turn outbox
+   * (bypassing context_engine_turn_outbox writes, crash recovery races, and
+   * stranded 'admitted' intent deadlocks), relying instead on afterTurn and
+   * assemble for all context management. Defaults to true for back-compat.
+   */
+  durableAdvancement?: boolean;
   /** Lossless-owned JSONL log file, written in addition to the OpenClaw runtime logger. */
   independentLogFile: IndependentLogFileConfig;
   /** Hard ceiling for assembly token budget — caps runtime-provided and fallback budgets. */
@@ -766,6 +774,10 @@ export function resolveLcmConfigWithDiagnostics(
           ? env.LCM_ENABLE_SUMMARY_THINKING === "true"
           : toBool(pc.enableSummaryThinking) ?? true,
       proactiveThresholdCompactionMode,
+      durableAdvancement:
+        env.LCM_DURABLE_ADVANCEMENT !== undefined
+          ? env.LCM_DURABLE_ADVANCEMENT !== "false"
+          : toBool(pc.durableAdvancement) ?? true,
       independentLogFile: {
         enabled:
           env.LCM_LOG_FILE_ENABLED !== undefined
