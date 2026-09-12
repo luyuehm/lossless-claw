@@ -1826,7 +1826,7 @@ export class LcmContextEngine implements ContextEngine {
             ok: true,
             compacted: false,
             pending: true,
-            reason: lastResult.reason,
+            reason: "already under target: no claimable pending summary nodes",
             result: lastResult,
           };
         }
