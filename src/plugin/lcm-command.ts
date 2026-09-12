@@ -27,6 +27,11 @@ import {
   type DoctorCleanerId,
 } from "./lcm-doctor-cleaners.js";
 import {
+  applyOrphanedAdvancements,
+  scanOrphanedAdvancements,
+  type OrphanedAdvancementApplyResult,
+} from "./lcm-doctor-orphaned-advancements.js";
+import {
   detectDoctorMarker,
   getDoctorSummaryStats,
   type DoctorSummaryStats,
@@ -130,6 +135,7 @@ type ParsedLcmCommand =
   | { kind: "doctor_maintenance"; apply: true; conversationId: number; confirmed: boolean }
   | { kind: "doctor_rollover_splits"; apply: boolean; applyOptions?: RolloverSplitApplyOptions }
   | { kind: "doctor_cleaners"; apply: boolean; filterId?: DoctorCleanerId; vacuum: boolean }
+  | { kind: "doctor_orphaned_advancements"; apply: boolean; vacuum: boolean }
   | { kind: "help"; error?: string };
 
 type FocusCompactionCommandEngine = {
@@ -747,8 +753,25 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       if (rest.length === 1 && rest[0]?.toLowerCase() === "anchors") {
         return { kind: "doctor_anchors" };
       }
+      if (rest.length === 1 && rest[0]?.toLowerCase() === "orphaned") {
+        return { kind: "doctor_orphaned_advancements", apply: false, vacuum: false };
+      }
       if (rest.length === 1 && rest[0]?.toLowerCase() === "maintenance") {
         return { kind: "doctor_maintenance", apply: false };
+      }
+      if (rest.length === 1 && rest[0]?.toLowerCase() === "orphaned-advancements") {
+        return { kind: "doctor_orphaned_advancements", apply: false, vacuum: false };
+      }
+      if (
+        rest.length >= 2 &&
+        rest[0]?.toLowerCase() === "orphaned-advancements" &&
+        rest[1]?.toLowerCase() === "apply"
+      ) {
+        return {
+          kind: "doctor_orphaned_advancements",
+          apply: true,
+          vacuum: rest.slice(2).some((token) => token.toLowerCase() === "vacuum"),
+        };
       }
       if (rest[0]?.toLowerCase() === "clean" && rest[1]?.toLowerCase() === "apply") {
         const parsedApply = parseDoctorCleanerApplyArgs(rest.slice(2));
@@ -771,6 +794,10 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
             }
           : { kind: "help", error: parsedApply.error };
       }
+      if (rest[0]?.toLowerCase() === "orphaned" && rest[1]?.toLowerCase() === "apply") {
+        const vacuum = rest.slice(2).some((token) => token.toLowerCase() === "vacuum");
+        return { kind: "doctor_orphaned_advancements", apply: true, vacuum };
+      }
       if (rest[0]?.toLowerCase() === "apply" && rest[1]?.toLowerCase() === "maintenance") {
         const parsedApply = parseMaintenanceApplyArgs(rest.slice(2));
         return parsedApply.ok
@@ -791,14 +818,14 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
       return {
         kind: "help",
         error:
-          `\`${VISIBLE_COMMAND} doctor\` accepts no arguments, \`anchors\` for transcript anchor diagnostics, \`maintenance\` for compaction-debt diagnostics, \`apply maintenance <conversation-id> confirm-inactive\` for audited inactive-debt closure, \`rollover-splits\` for global rollover diagnostics, \`apply rollover-splits [confirm]\` for backup-first split repair, \`clean\` for global high-confidence junk diagnostics, \`clean apply [filter-id] [vacuum]\` for cleanup, \`apply [confirm-offline]\` for current-conversation repair, or \`apply <conversation-id> confirm-offline\` for targeted repair.`,
+          `\`${VISIBLE_COMMAND} doctor\` accepts no arguments, \`anchors\` for transcript anchor diagnostics, \`maintenance\` for compaction-debt diagnostics, \`apply maintenance <conversation-id> confirm-inactive\` for audited inactive-debt closure, \`rollover-splits\` for global rollover diagnostics, \`apply rollover-splits [confirm]\` for backup-first split repair, \`clean\` for global high-confidence junk diagnostics, \`clean apply [filter-id] [vacuum]\` for cleanup, \`orphaned-advancements\` for cross-agent turn-advancement diagnostics, \`orphaned-advancements apply [vacuum]\` for backup-first orphan cleanup, \`apply [confirm-offline]\` for current-conversation repair, or \`apply <conversation-id> confirm-offline\` for targeted repair.`,
       };
     case "help":
       return { kind: "help" };
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, focus, refocus, unfocus, backup, doctor, doctor clean, doctor apply, help.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, focus, refocus, unfocus, backup, doctor, doctor clean, doctor orphaned, doctor apply, help.`,
       };
   }
 }
@@ -1452,6 +1479,14 @@ function buildHelpText(error?: string): string {
         formatCommand(`${VISIBLE_COMMAND} doctor clean apply`),
         "Delete approved high-confidence cleaner matches after creating a DB backup.",
       ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} doctor orphaned`),
+        "Report orphaned context-engine turn advancements across agent databases.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} doctor orphaned apply`),
+        "Delete orphaned turn advancements after backing up each affected agent database.",
+      ),
       buildStatLine(formatCommand(`${VISIBLE_COMMAND} doctor apply`), "Repair broken summaries in the current conversation."),
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} doctor apply <conversation-id> confirm-offline`),
@@ -1952,6 +1987,109 @@ async function buildDoctorCleanersText(params: {
       `Review the examples, then run ${formatCommand(`${VISIBLE_COMMAND} doctor clean apply`)} to delete approved matches after Lossless Claw creates a backup.`,
     ]),
   );
+
+  return lines.join("\n");
+}
+
+function buildDoctorOrphanedAdvancementsText(): string {
+  // Orphaned turn advancements live in each agent's own database, so scan
+  // every agent database on disk rather than only the configured agent list.
+  // A configured-only scan would silently miss orphaned rows in retired or
+  // profile-local agent databases.
+  const scan = scanOrphanedAdvancements();
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🩺 Lossless Claw Doctor: Orphaned Turn Advancements",
+    "",
+    buildSection("🌐 Scan scope", [
+      buildStatLine("agent databases scanned", formatNumber(scan.databasesScanned)),
+      buildStatLine("orphaned advancements", formatNumber(scan.totalOrphaned)),
+      buildStatLine("mode", "read-only diagnostics"),
+    ]),
+  ];
+
+  if (scan.totalOrphaned === 0) {
+    lines.push(
+      "",
+      buildSection("✅ Result", ["No orphaned turn advancements detected."]),
+    );
+    return lines.join("\n");
+  }
+
+  for (const agent of scan.agentRows) {
+    lines.push(
+      "",
+      buildSection(`🤖 ${agent.agentId}`, [
+        buildStatLine("orphaned", formatNumber(agent.count)),
+        buildStatLine("admitted", formatNumber(agent.byState.admitted)),
+        buildStatLine("blocked", formatNumber(agent.byState.blocked)),
+      ]),
+    );
+    for (const example of agent.examples) {
+      const detail = example.failure ? ` (${example.failure})` : "";
+      lines.push(`  - ${example.state}${detail}: ${example.advancementKey}`);
+    }
+  }
+
+  lines.push(
+    "",
+    buildSection("🛠️ Next step", [
+      `Run ${formatCommand(`${VISIBLE_COMMAND} doctor orphaned apply`)} to delete orphaned advancements after Lossless Claw backs up each affected agent database.`,
+    ]),
+  );
+
+  return lines.join("\n");
+}
+
+function buildDoctorOrphanedAdvancementsApplyText(params: {
+  vacuum: boolean;
+}): string {
+  // Same as the read-only scan: operate on every agent database on disk.
+  const scan = scanOrphanedAdvancements();
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🩺 Lossless Claw Doctor: Orphaned Turn Advancements Apply",
+    "",
+    buildSection("🌐 Scope", [
+      buildStatLine("orphaned before apply", formatNumber(scan.totalOrphaned)),
+      buildStatLine("vacuum requested", formatBoolean(params.vacuum)),
+    ]),
+  ];
+
+  if (scan.totalOrphaned === 0) {
+    lines.push(
+      "",
+      buildSection("🛠️ Apply", [
+        buildStatLine("status", "completed"),
+        buildStatLine("result", "clean; no deletes ran"),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const results: OrphanedAdvancementApplyResult[] = applyOrphanedAdvancements();
+  for (const result of results) {
+    if (result.kind === "applied") {
+      lines.push(
+        "",
+        buildSection(`🤖 ${result.agentId}`, [
+          buildStatLine("status", "applied"),
+          buildStatLine("deleted rows", formatNumber(result.deletedRows)),
+          buildStatLine("backup path", result.backupPath),
+        ]),
+      );
+    } else {
+      lines.push(
+        "",
+        buildSection(`🤖 ${result.agentId}`, [
+          buildStatLine("status", "skipped"),
+          buildStatLine("reason", result.reason),
+        ]),
+      );
+    }
+  }
 
   return lines.join("\n");
 }
@@ -3358,6 +3496,16 @@ export function createLcmCommand(params: {
                   db: await getDb(),
                   agentIds: doctorCleanerAgentIds,
                 }),
+              };
+        case "doctor_orphaned_advancements":
+          return parsed.apply
+            ? {
+                text: buildDoctorOrphanedAdvancementsApplyText({
+                  vacuum: parsed.vacuum,
+                }),
+              }
+            : {
+                text: buildDoctorOrphanedAdvancementsText(),
               };
         case "help":
           return { text: buildHelpText(parsed.error) };
