@@ -175,6 +175,38 @@ type summaryGraph struct {
 	nodes          map[string]*summaryNode
 }
 
+// memoryHealth is a read-only snapshot used by the evidence/health panel.
+type memoryHealth struct {
+	compressionPct int
+	leafCount      int
+	condensedCount int
+	pendingCount   int
+	sourceTokens   int
+	summaryTokens  int
+}
+
+func loadMemoryHealth(dbPath string, conversationID int64) (memoryHealth, error) {
+	db, err := openLCMDB(dbPath)
+	if err != nil {
+		return memoryHealth{}, err
+	}
+	defer db.Close()
+	var h memoryHealth
+	err = db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN kind='leaf' THEN 1 ELSE 0 END),0), COALESCE(SUM(CASE WHEN kind='condensed' THEN 1 ELSE 0 END),0), COALESCE(SUM(token_count),0) FROM summaries WHERE conversation_id = ?`, conversationID).Scan(&h.leafCount, &h.condensedCount, &h.summaryTokens)
+	if err != nil {
+		return h, fmt.Errorf("query summary health: %w", err)
+	}
+	_ = db.QueryRow(`SELECT COALESCE(SUM(m.token_count),0) FROM summary_messages sm JOIN messages m ON m.message_id = sm.message_id JOIN summaries s ON s.summary_id = sm.summary_id WHERE s.conversation_id = ?`, conversationID).Scan(&h.sourceTokens)
+	var pendingTable int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='pending_summary_nodes'`).Scan(&pendingTable); err == nil && pendingTable > 0 {
+		_ = db.QueryRow(`SELECT COUNT(*) FROM pending_summary_nodes WHERE conversation_id = ? AND status NOT IN ('promoted','completed')`, conversationID).Scan(&h.pendingCount)
+	}
+	if h.sourceTokens > 0 {
+		h.compressionPct = h.summaryTokens * 100 / h.sourceTokens
+	}
+	return h, nil
+}
+
 // summaryRow is one visible row in the flattened summary tree.
 type summaryRow struct {
 	summaryID string
