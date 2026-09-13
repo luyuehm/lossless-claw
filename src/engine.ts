@@ -548,6 +548,18 @@ export class LcmContextEngine implements ContextEngine {
    * or host `maintain()` instead of spinning forever.
    */
   private pendingSummaryDrainStallCounts = new Map<string, number>();
+  /**
+   * Tracks consecutive no-progress deferred-compaction debt drains per queue.
+   *
+   * The deferred-compaction drain re-schedules itself via `setImmediate` while
+   * the conversation still reports pending debt. A debt that can never converge
+   * (e.g. repeated `compacted but still over target`) turns that into an
+   * unbounded `setImmediate` hot loop that pins the Node event loop at ~100%
+   * CPU and starves the host agent. This counter backs off the re-schedule and
+   * eventually stops it, so convergence is re-attempted by the next user turn
+   * or host `maintain()` instead of spinning forever.
+   */
+  private deferredCompactionDrainStallCounts = new Map<string, number>();
   private previousAssembledMessagesByConversation = new Map<number, AssemblePrefixSnapshot>();
   private recentBootstrapImportsByConversation = new Map<number, BootstrapImportObservation>();
   private deps: LcmDependencies;
@@ -1026,7 +1038,57 @@ export class LcmContextEngine implements ContextEngine {
 
   /** Try deferred compaction later without letting it jump ahead of foreground work. */
   private scheduleDeferredCompactionDebtDrain(params: DeferredCompactionDebtDrainParams): void {
-    const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
+    this.scheduleDeferredCompactionDebtDrainWithBackoff(params, this.resolveSessionQueueKey(params.sessionId, params.sessionKey));
+  }
+
+  /**
+   * Re-schedule a deferred-compaction debt drain after a non-converging pass,
+   * backing off instead of spinning `setImmediate` forever.
+   *
+   * Returns false when the queue has stalled past the hard limit and the drain
+   * should stop until the next user turn or host `maintain()`.
+   */
+  private rescheduleDeferredCompactionDebtDrainWithBackoff(
+    params: DeferredCompactionDebtDrainParams,
+    queueKey: string,
+  ): boolean {
+    const stallCount = (this.deferredCompactionDrainStallCounts.get(queueKey) ?? 0) + 1;
+    this.deferredCompactionDrainStallCounts.set(queueKey, stallCount);
+
+    // Beyond this many consecutive no-progress drains, stop re-scheduling.
+    const HARD_LIMIT = 8;
+    if (stallCount >= HARD_LIMIT) {
+      this.deferredCompactionDrainStallCounts.delete(queueKey);
+      this.deps.log.warn(
+        `[lcm] deferred compaction drain stalled conversation=${params.conversationId} ${formatSessionLabel(params.sessionId, params.sessionKey)} stalls=${stallCount}; deferring to next turn/maintain`,
+      );
+      return false;
+    }
+
+    // Exponential backoff: 0ms, 50ms, 100ms, 200ms, 400ms, 800ms, 1600ms, then
+    // the hard limit fires.
+    const delayMs = stallCount <= 2 ? 0 : Math.min(1600, 50 * 2 ** (stallCount - 3));
+    const run = () => {
+      void this.drainDeferredCompactionDebtIfIdle({ ...params, queueKey }).catch((err) => {
+        this.deps.log.warn(
+          `[lcm] background deferred compaction failed conversation=${params.conversationId} session=${params.sessionId}: ${describeLogError(err)}`,
+        );
+      });
+    };
+    if (delayMs === 0) {
+      setImmediate(run);
+    } else {
+      setTimeout(run, delayMs);
+    }
+    return true;
+  }
+
+  /** Schedule a deferred-compaction debt drain immediately (first attempt). */
+  private scheduleDeferredCompactionDebtDrainWithBackoff(
+    params: DeferredCompactionDebtDrainParams,
+    queueKey: string,
+  ): void {
+    this.deferredCompactionDrainStallCounts.delete(queueKey);
     setImmediate(() => {
       void this.drainDeferredCompactionDebtIfIdle({
         ...params,
@@ -1303,10 +1365,23 @@ export class LcmContextEngine implements ContextEngine {
           result?.changed === true && result.reason === "pending summaries published"
             ? await this.summaryStore.getContextTokenCount(params.conversationId)
             : params.currentTokenCount;
-        this.scheduleDeferredCompactionDebtDrain({
-          ...params,
-          currentTokenCount,
-        });
+        // Back off on no-progress passes so a non-converging debt (e.g.
+        // "compacted but still over target") cannot spin the event loop forever.
+        const madeProgress = result?.changed === true;
+        if (madeProgress) {
+          this.deferredCompactionDrainStallCounts.delete(params.queueKey);
+          this.scheduleDeferredCompactionDebtDrain({
+            ...params,
+            currentTokenCount,
+          });
+        } else {
+          this.rescheduleDeferredCompactionDebtDrainWithBackoff(
+            { ...params, currentTokenCount },
+            params.queueKey,
+          );
+        }
+      } else {
+        this.deferredCompactionDrainStallCounts.delete(params.queueKey);
       }
     } finally {
       this.deferredCompactionDrains.delete(params.queueKey);
