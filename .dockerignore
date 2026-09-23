@@ -1,0 +1,10 @@
+.git
+.gitattributes
+.github
+.changeset
+node_modules
+dist
+audit
+*.log
+.DS_Store
+plugin-inspector-reports
