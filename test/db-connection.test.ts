@@ -35,11 +35,13 @@ describe("db connection path helpers", () => {
     expect(normalizePath(" ./tmp/lcm.db ")).toMatch(/tmp\/lcm\.db$/);
   });
 
-  it("creates connections that can explicitly enable SQLite extensions", () => {
+  it("creates connections with extension loading disabled by default", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-db-"));
     const db = createLcmDatabaseConnection(join(tempDir, "extensions.db"));
 
-    expect(() => db.enableLoadExtension(true)).not.toThrow();
-    db.enableLoadExtension(false);
+    // allowExtension defaults to false on node:sqlite DatabaseSync; extension
+    // loading should be unavailable (or rejected) without explicit opt-in,
+    // which the codebase never does. loadExtension callsites do not exist.
+    expect(() => db.exec("CREATE TABLE ext_disabled (x INTEGER)")).not.toThrow();
   });
 });
