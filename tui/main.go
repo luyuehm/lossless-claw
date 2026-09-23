@@ -111,6 +111,7 @@ type model struct {
 	sessions          []sessionEntry
 	messages          []sessionMessage
 	summary           summaryGraph
+	memoryHealth      memoryHealth
 	summaryRows       []summaryRow
 
 	largeFiles []largeFileEntry
@@ -502,6 +503,7 @@ func (m model) handleConversationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.summarySources = make(map[string][]summarySource)
 		m.summarySourceErr = make(map[string]string)
 		m.loadCurrentSummarySources()
+		m.memoryHealth, _ = loadMemoryHealth(m.paths.lcmDBPath, summary.conversationID)
 		m.screen = screenSummaries
 		m.status = fmt.Sprintf("Loaded %d summaries for conversation %d", len(summary.nodes), summary.conversationID)
 	case "f":
@@ -782,6 +784,7 @@ func (m model) handleSummariesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.summarySources = make(map[string][]summarySource)
 		m.summarySourceErr = make(map[string]string)
 		m.loadCurrentSummarySources()
+		m.memoryHealth, _ = loadMemoryHealth(m.paths.lcmDBPath, summary.conversationID)
 		m.status = fmt.Sprintf("Reloaded %d summaries", len(summary.nodes))
 	case "b", "backspace":
 		m.screen = screenConversation
@@ -1993,7 +1996,11 @@ func (m model) renderSummaries() string {
 		return "Summary graph is empty"
 	}
 
-	available := max(4, m.height-5) // 5 = title + 2-line help + body padding + status
+	health := m.memoryHealth
+	healthLine := fmt.Sprintf("MEMORY HEALTH  compression %3d%%  summaries leaf %3d / condensed %3d  pending %3d  tokens %d -> %d",
+		health.compressionPct, health.leafCount, health.condensedCount, health.pendingCount, health.sourceTokens, health.summaryTokens)
+	healthLine = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("51")).Render(healthLine)
+	available := max(4, m.height-6) // header, two-line help, health, separator, status
 	detailHeight := max(7, available/3)
 	listHeight := max(3, available-detailHeight-1)
 
@@ -2027,7 +2034,7 @@ func (m model) renderSummaries() string {
 	}
 
 	detailLines := m.renderSummaryDetail(detailHeight)
-	return strings.Join(listLines, "\n") + "\n" + helpStyle.Render(strings.Repeat("-", max(20, m.width-1))) + "\n" + strings.Join(detailLines, "\n")
+	return healthLine + "\n" + strings.Join(listLines, "\n") + "\n" + helpStyle.Render(strings.Repeat("-", max(20, m.width-1))) + "\n" + strings.Join(detailLines, "\n")
 }
 
 // renderDissolveConfirmation draws the preview/confirmation overlay for DAG dissolve.
@@ -2205,7 +2212,7 @@ func (m *model) renderSummaryDetail(detailHeight int) []string {
 		allLines = append(allLines, "  "+line)
 	}
 
-	allLines = append(allLines, "Sources:")
+	allLines = append(allLines, "Evidence chain (original message IDs):")
 	if errMsg, exists := m.summarySourceErr[id]; exists {
 		allLines = append(allLines, "  error: "+errMsg)
 	} else {
